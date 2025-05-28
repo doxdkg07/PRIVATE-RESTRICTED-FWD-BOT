@@ -3,8 +3,9 @@
 
 from asyncio.subprocess import PIPE
 import os
+import asyncio
 from time import time
-from typing import Optional
+from typing import Optional, List, Dict, Any
 from asyncio import create_subprocess_exec, create_subprocess_shell, wait_for
 from PIL import Image
 from pyleaves import Leaves
@@ -16,6 +17,7 @@ from pyrogram.types import (
     InputMediaDocument,
     InputMediaAudio,
     Voice,
+    Message
 )
 
 from logger import LOGGER
@@ -279,59 +281,69 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
     if forward_chat_id:
         LOGGER(__name__).info(f"Media group will be forwarded to channel/group ID: {forward_chat_id}")
 
+    # Use a semaphore to limit concurrent downloads
+    semaphore = asyncio.Semaphore(3)  # Allow 3 concurrent downloads
+    download_tasks = []
+
     for msg in media_group_messages:
         if msg.photo or msg.video or msg.document or msg.audio:
-            try:
-                media_path = await msg.download(
-                    progress=Leaves.progress_for_pyrogram,
-                    progress_args=progressArgs(
-                        "📥 Downloading Progress", progress_message, start_time
-                    ),
+            # Create a task for each media download
+            task = asyncio.create_task(
+                download_media_item(
+                    msg, semaphore, progress_message, start_time, temp_paths, invalid_paths
                 )
-                temp_paths.append(media_path)
+            )
+            download_tasks.append(task)
 
-                if msg.photo:
-                    valid_media.append(
-                        InputMediaPhoto(
-                            media=media_path,
-                            caption=await get_parsed_msg(
-                                msg.caption or "", msg.caption_entities
-                            ),
-                        )
-                    )
-                elif msg.video:
-                    valid_media.append(
-                        InputMediaVideo(
-                            media=media_path,
-                            caption=await get_parsed_msg(
-                                msg.caption or "", msg.caption_entities
-                            ),
-                        )
-                    )
-                elif msg.document:
-                    valid_media.append(
-                        InputMediaDocument(
-                            media=media_path,
-                            caption=await get_parsed_msg(
-                                msg.caption or "", msg.caption_entities
-                            ),
-                        )
-                    )
-                elif msg.audio:
-                    valid_media.append(
-                        InputMediaAudio(
-                            media=media_path,
-                            caption=await get_parsed_msg(
-                                msg.caption or "", msg.caption_entities
-                            ),
-                        )
-                    )
+    # Wait for all downloads to complete
+    await asyncio.gather(*download_tasks)
 
-            except Exception as e:
-                LOGGER(__name__).info(f"Error downloading media: {e}")
-                if media_path and os.path.exists(media_path):
-                    invalid_paths.append(media_path)
-                continue
+    # Process downloaded media
+    for msg, media_path in zip(media_group_messages, temp_paths):
+        if not media_path or not os.path.exists(media_path):
+            continue
+
+        try:
+            if msg.photo:
+                valid_media.append(
+                    InputMediaPhoto(
+                        media=media_path,
+                        caption=await get_parsed_msg(
+                            msg.caption or "", msg.caption_entities
+                        ),
+                    )
+                )
+            elif msg.video:
+                valid_media.append(
+                    InputMediaVideo(
+                        media=media_path,
+                        caption=await get_parsed_msg(
+                            msg.caption or "", msg.caption_entities
+                        ),
+                    )
+                )
+            elif msg.document:
+                valid_media.append(
+                    InputMediaDocument(
+                        media=media_path,
+                        caption=await get_parsed_msg(
+                            msg.caption or "", msg.caption_entities
+                        ),
+                    )
+                )
+            elif msg.audio:
+                valid_media.append(
+                    InputMediaAudio(
+                        media=media_path,
+                        caption=await get_parsed_msg(
+                            msg.caption or "", msg.caption_entities
+                        ),
+                    )
+                )
+        except Exception as e:
+            LOGGER(__name__).error(f"Error processing downloaded media: {e}")
+            if media_path and os.path.exists(media_path):
+                invalid_paths.append(media_path)
 
     LOGGER(__name__).info(f"Valid media count: {len(valid_media)}")
 
@@ -398,3 +410,166 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
         if os.path.exists(path):
             os.remove(path)
     return False
+
+
+async def download_media_item(msg, semaphore, progress_message, start_time, temp_paths, invalid_paths):
+    """Download a single media item with semaphore control for concurrency"""
+    async with semaphore:
+        try:
+            if msg.video or (msg.document and msg.document.mime_type == "application/pdf"):
+                # Use optimized download for videos and PDFs
+                media_path = await download_media_with_speed_optimization(
+                    msg,
+                    progress_message=progress_message,
+                    start_time=start_time
+                )
+            else:
+                # Use standard download for other media types
+                media_path = await msg.download(
+                    progress=Leaves.progress_for_pyrogram,
+                    progress_args=progressArgs(
+                        "📥 Downloading Progress", progress_message, start_time
+                    ),
+                )
+            
+            temp_paths.append(media_path)
+            return media_path
+        except Exception as e:
+            LOGGER(__name__).error(f"Error downloading media: {e}")
+            invalid_paths.append(None)
+            return None
+
+
+async def download_media_with_speed_optimization(message, progress_message=None, start_time=None):
+    """
+    Optimized download function for large files like videos and PDFs
+    Uses stream_media with larger chunk size and concurrent processing
+    """
+    try:
+        # Create a unique filename for the download
+        file_name = f"downloads/{int(time())}"
+        os.makedirs("downloads", exist_ok=True)
+        
+        # Determine file extension
+        if message.video:
+            file_name += ".mp4"
+        elif message.document:
+            mime_type = message.document.mime_type
+            if mime_type == "application/pdf":
+                file_name += ".pdf"
+            else:
+                # Get extension from file name if available
+                original_name = message.document.file_name
+                if original_name and "." in original_name:
+                    extension = original_name.split(".")[-1]
+                    file_name += f".{extension}"
+                else:
+                    file_name += ".bin"  # Default binary extension
+        else:
+            # Default extension for other types
+            file_name += ".bin"
+        
+        # Get file size for progress reporting
+        file_size = 0
+        if message.video:
+            file_size = message.video.file_size
+        elif message.document:
+            file_size = message.document.file_size
+        
+        # Prepare for chunked download
+        CHUNK_SIZE = 1024 * 1024 * 4  # 4MB chunks for faster download
+        MAX_CONCURRENT_CHUNKS = 5  # Number of chunks to download concurrently
+        
+        # Calculate number of chunks
+        total_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+        
+        # Create file and pre-allocate space
+        with open(file_name, "wb") as f:
+            f.seek(file_size - 1)
+            f.write(b'\0')
+        
+        # Set up semaphore for concurrent downloads
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHUNKS)
+        
+        # Last progress update time to avoid too frequent updates
+        last_progress_time = [time()]  # Use list for mutable reference
+        downloaded_bytes = [0]  # Track total downloaded bytes
+        
+        async def download_chunk(chunk_index):
+            """Download a specific chunk of the file"""
+            nonlocal file_name, CHUNK_SIZE, file_size
+            
+            async with semaphore:
+                offset = chunk_index * CHUNK_SIZE
+                limit = min(CHUNK_SIZE, file_size - offset)
+                
+                # Skip if beyond file size
+                if offset >= file_size:
+                    return
+                
+                try:
+                    # Download chunk
+                    chunk = await message.download(
+                        file_name=None,  # Return bytes instead of saving
+                        in_memory=True,
+                        block=False,
+                        offset=offset,
+                        limit=limit
+                    )
+                    
+                    # Write chunk to file at correct position
+                    with open(file_name, "r+b") as f:
+                        f.seek(offset)
+                        f.write(chunk)
+                    
+                    # Update progress
+                    downloaded_bytes[0] += len(chunk)
+                    
+                    # Update progress message (not too frequently)
+                    current_time = time()
+                    if progress_message and (current_time - last_progress_time[0] > 1.0):
+                        last_progress_time[0] = current_time
+                        elapsed = current_time - start_time
+                        speed = downloaded_bytes[0] / elapsed if elapsed > 0 else 0
+                        percentage = (downloaded_bytes[0] / file_size) * 100 if file_size > 0 else 0
+                        
+                        # Estimate time remaining
+                        if speed > 0:
+                            eta = (file_size - downloaded_bytes[0]) / speed
+                        else:
+                            eta = 0
+                        
+                        progress_text = f"📥 Downloading: {percentage:.1f}%\n"
+                        progress_text += f"Speed: {get_readable_file_size(speed)}/s\n"
+                        progress_text += f"ETA: {get_readable_time(int(eta))}"
+                        
+                        await progress_message.edit(progress_text)
+                        
+                except Exception as e:
+                    LOGGER(__name__).error(f"Error downloading chunk {chunk_index}: {e}")
+                    raise
+        
+        # Create download tasks for all chunks
+        tasks = []
+        for i in range(total_chunks):
+            task = asyncio.create_task(download_chunk(i))
+            tasks.append(task)
+        
+        # Wait for all chunks to download
+        await asyncio.gather(*tasks)
+        
+        # Final progress update
+        if progress_message:
+            await progress_message.edit("📥 Download complete! Processing...")
+        
+        return file_name
+        
+    except Exception as e:
+        LOGGER(__name__).error(f"Error in optimized download: {e}")
+        # Fall back to regular download if optimized method fails
+        return await message.download(
+            progress=Leaves.progress_for_pyrogram if progress_message else None,
+            progress_args=progressArgs(
+                "📥 Downloading Progress", progress_message, start_time
+            ) if progress_message else None,
+        )
