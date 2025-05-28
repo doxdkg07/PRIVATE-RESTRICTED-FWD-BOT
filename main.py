@@ -1,4 +1,3 @@
-# Copyright (C) @TheSmartBisnu
 # Channel: https://t.me/itsSmartDev
 
 import os
@@ -11,6 +10,7 @@ from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, BadRequest
 from pyleaves import Leaves
+from PIL import Image
 
 from helpers.utils import (
     getChatMsgID,
@@ -21,8 +21,8 @@ from helpers.utils import (
     send_media,
     get_readable_file_size,
     get_readable_time,
-    get_media_info,  # Added this import
-    get_video_thumbnail,  # Added this import
+    get_media_info,
+    get_video_thumbnail,
 )
 
 from config import PyroConf
