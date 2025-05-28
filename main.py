@@ -3,6 +3,7 @@
 
 import os
 import shutil
+import asyncio
 from time import time
 
 import psutil
@@ -11,6 +12,14 @@ from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, BadRequest
 from pyleaves import Leaves
+
+# Import uvloop for asyncio performance boost
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    UVLOOP_ENABLED = True
+except ImportError:
+    UVLOOP_ENABLED = False
 
 from helpers.utils import (
     getChatMsgID,
@@ -21,12 +30,18 @@ from helpers.utils import (
     send_media,
     get_readable_file_size,
     get_readable_time,
-    get_media_info,  # Added this import
-    get_video_thumbnail,  # Added this import
+    get_media_info,
+    get_video_thumbnail,
 )
+
+# Import the FastDownloader
+from fast_downloader import FastDownloader
 
 from config import PyroConf
 from logger import LOGGER
+
+# Initialize the fast downloader
+fast_downloader = FastDownloader(chunk_size=4*1024*1024, max_concurrent_chunks=5)
 
 # Initialize the bot client
 bot = Client(
@@ -135,35 +150,57 @@ async def download_message_range(bot: Client, message: Message, user: Client, ch
     failed_count = 0
     skipped_count = 0
     
-    for msg_id in range(start_id, end_id + 1):
-        try:
-            chat_message = await user.get_messages(chat_id=chat_id, message_ids=msg_id)
-            
-            if not chat_message:
-                LOGGER(__name__).info(f"Message {msg_id} not found, skipping.")
-                skipped_count += 1
-                continue
+    # Create a semaphore to limit concurrent downloads
+    semaphore = asyncio.Semaphore(3)
+    
+    async def process_message_with_semaphore(msg_id):
+        nonlocal success_count, failed_count, skipped_count
+        
+        async with semaphore:
+            try:
+                chat_message = await user.get_messages(chat_id=chat_id, message_ids=msg_id)
                 
-            LOGGER(__name__).info(f"Processing message ID: {msg_id}")
-            
-            # Update status periodically
-            if msg_id % 5 == 0 or msg_id == start_id:
-                await status_message.edit(
-                    f"**📥 Downloading messages {start_id} to {end_id}...**\n"
-                    f"**Current: {msg_id}/{end_id}**\n"
-                    f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
-                )
-            
-            result = await process_message(bot, message, user, chat_message, forward_chat_id)
-            if result:
-                success_count += 1
-            else:
+                if not chat_message:
+                    LOGGER(__name__).info(f"Message {msg_id} not found, skipping.")
+                    skipped_count += 1
+                    return
+                    
+                LOGGER(__name__).info(f"Processing message ID: {msg_id}")
+                
+                result = await process_message(bot, message, user, chat_message, forward_chat_id)
+                if result:
+                    success_count += 1
+                else:
+                    failed_count += 1
+                    
+            except Exception as e:
+                LOGGER(__name__).error(f"Error processing message {msg_id}: {str(e)}")
                 failed_count += 1
-                
-        except Exception as e:
-            LOGGER(__name__).error(f"Error processing message {msg_id}: {str(e)}")
-            failed_count += 1
-            continue
+    
+    # Create tasks for all message IDs
+    tasks = []
+    for msg_id in range(start_id, end_id + 1):
+        task = asyncio.create_task(process_message_with_semaphore(msg_id))
+        tasks.append(task)
+    
+    # Update status periodically
+    async def update_status():
+        while tasks:
+            await status_message.edit(
+                f"**📥 Downloading messages {start_id} to {end_id}...**\n"
+                f"**Progress: {success_count + failed_count + skipped_count}/{end_id - start_id + 1}**\n"
+                f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
+            )
+            await asyncio.sleep(5)
+    
+    # Start status updater
+    status_updater = asyncio.create_task(update_status())
+    
+    # Wait for all tasks to complete
+    await asyncio.gather(*tasks)
+    
+    # Cancel status updater
+    status_updater.cancel()
     
     # Final status update
     await status_message.edit(
@@ -213,12 +250,30 @@ async def process_message(bot: Client, message: Message, user: Client, chat_mess
             start_time = time()
             progress_message = await message.reply("**📥 Downloading Progress...**")
 
-            media_path = await chat_message.download(
-                progress=Leaves.progress_for_pyrogram,
-                progress_args=progressArgs(
-                    "📥 Downloading Progress", progress_message, start_time
-                ),
+            # Check if it's an MP4 video for fast download
+            is_mp4_video = (
+                (chat_message.video and chat_message.video.mime_type == "video/mp4") or
+                (chat_message.document and chat_message.document.mime_type == "video/mp4")
             )
+            
+            # Use fast downloader for MP4 videos
+            if is_mp4_video:
+                LOGGER(__name__).info("Using fast downloader for MP4 video")
+                media_path = await fast_downloader.download_video(
+                    chat_message,
+                    progress=Leaves.progress_for_pyrogram,
+                    progress_args=progressArgs(
+                        "📥 Fast Downloading Progress", progress_message, start_time
+                    ),
+                )
+            else:
+                # Use standard download for other media types
+                media_path = await chat_message.download(
+                    progress=Leaves.progress_for_pyrogram,
+                    progress_args=progressArgs(
+                        "📥 Downloading Progress", progress_message, start_time
+                    ),
+                )
 
             LOGGER(__name__).info(f"Downloaded media: {media_path}")
 
@@ -252,8 +307,8 @@ async def process_message(bot: Client, message: Message, user: Client, chat_mess
                 thumb = await get_video_thumbnail(media_path, duration)
                 
                 # Get original video dimensions from the message
-                width = chat_message.video.width
-                height = chat_message.video.height
+                width = chat_message.video.width if chat_message.video else None
+                height = chat_message.video.height if chat_message.video else None
                 
                 # If dimensions are not available in the message, try to get from thumbnail
                 if (not width or not height) and thumb is not None and thumb != "none":
@@ -352,6 +407,7 @@ async def stats(_, message: Message):
         f"**➜ CPU:** `{cpuUsage}%` | "
         f"**➜ RAM:** `{memory}%` | "
         f"**➜ DISK:** `{disk}%`"
+        f"{' | **➜ uvloop:** `Enabled`' if UVLOOP_ENABLED else ''}"
     )
     await message.reply(stats)
 
@@ -392,6 +448,8 @@ if __name__ == "__main__":
         
         # Start the bot in the main thread
         LOGGER(__name__).info("Bot Started!")
+        if UVLOOP_ENABLED:
+            LOGGER(__name__).info("uvloop is enabled for improved performance")
         user.start()
         bot.run()
         
