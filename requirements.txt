@@ -4,3 +4,4 @@ Pyleaves
 python-dotenv
 psutil
 pillow
+flask
