@@ -4,7 +4,6 @@
 import os
 import shutil
 from time import time
-import asyncio
 
 import psutil
 from pyrogram.types import Message
@@ -12,14 +11,6 @@ from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, BadRequest
 from pyleaves import Leaves
-
-# Enable uvloop for better asyncio performance
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    print("uvloop enabled for better performance")
-except ImportError:
-    print("uvloop not available, using standard asyncio")
 
 from helpers.utils import (
     getChatMsgID,
@@ -30,7 +21,8 @@ from helpers.utils import (
     send_media,
     get_readable_file_size,
     get_readable_time,
-    download_media_with_speed_optimization,
+    get_media_info,  # Added this import
+    get_video_thumbnail,  # Added this import
 )
 
 from config import PyroConf
@@ -143,51 +135,14 @@ async def download_message_range(bot: Client, message: Message, user: Client, ch
     failed_count = 0
     skipped_count = 0
     
-    # Use a semaphore to limit concurrent downloads
-    semaphore = asyncio.Semaphore(3)  # Allow 3 concurrent downloads
-    tasks = []
-    
     for msg_id in range(start_id, end_id + 1):
-        # Create a task for each message download
-        task = asyncio.create_task(
-            process_message_with_semaphore(
-                semaphore, bot, message, user, chat_id, msg_id, 
-                forward_chat_id, status_message, start_id, end_id,
-                success_count, failed_count, skipped_count
-            )
-        )
-        tasks.append(task)
-    
-    # Wait for all tasks to complete
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Count results
-    for result in results:
-        if isinstance(result, tuple):
-            status, _ = result
-            if status == "success":
-                success_count += 1
-            elif status == "failed":
-                failed_count += 1
-            elif status == "skipped":
-                skipped_count += 1
-    
-    # Final status update
-    await status_message.edit(
-        f"**✅ Download completed for messages {start_id} to {end_id}**\n"
-        f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
-    )
-
-async def process_message_with_semaphore(semaphore, bot, message, user, chat_id, msg_id, 
-                                        forward_chat_id, status_message, start_id, end_id,
-                                        success_count, failed_count, skipped_count):
-    async with semaphore:  # This limits concurrent downloads
         try:
             chat_message = await user.get_messages(chat_id=chat_id, message_ids=msg_id)
             
             if not chat_message:
                 LOGGER(__name__).info(f"Message {msg_id} not found, skipping.")
-                return "skipped", msg_id
+                skipped_count += 1
+                continue
                 
             LOGGER(__name__).info(f"Processing message ID: {msg_id}")
             
@@ -201,13 +156,20 @@ async def process_message_with_semaphore(semaphore, bot, message, user, chat_id,
             
             result = await process_message(bot, message, user, chat_message, forward_chat_id)
             if result:
-                return "success", msg_id
+                success_count += 1
             else:
-                return "failed", msg_id
+                failed_count += 1
                 
         except Exception as e:
             LOGGER(__name__).error(f"Error processing message {msg_id}: {str(e)}")
-            return "failed", msg_id
+            failed_count += 1
+            continue
+    
+    # Final status update
+    await status_message.edit(
+        f"**✅ Download completed for messages {start_id} to {end_id}**\n"
+        f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
+    )
 
 async def process_message(bot: Client, message: Message, user: Client, chat_message, forward_chat_id=None):
     try:
@@ -251,21 +213,12 @@ async def process_message(bot: Client, message: Message, user: Client, chat_mess
             start_time = time()
             progress_message = await message.reply("**📥 Downloading Progress...**")
 
-            # Use optimized download function for videos and documents (PDFs)
-            if chat_message.video or (chat_message.document and chat_message.document.mime_type == "application/pdf"):
-                media_path = await download_media_with_speed_optimization(
-                    chat_message,
-                    progress_message=progress_message,
-                    start_time=start_time
-                )
-            else:
-                # Use standard download for other media types
-                media_path = await chat_message.download(
-                    progress=Leaves.progress_for_pyrogram,
-                    progress_args=progressArgs(
-                        "📥 Downloading Progress", progress_message, start_time
-                    ),
-                )
+            media_path = await chat_message.download(
+                progress=Leaves.progress_for_pyrogram,
+                progress_args=progressArgs(
+                    "📥 Downloading Progress", progress_message, start_time
+                ),
+            )
 
             LOGGER(__name__).info(f"Downloaded media: {media_path}")
 
@@ -293,14 +246,24 @@ async def process_message(bot: Client, message: Message, user: Client, chat_mess
             elif media_type == "video":
                 if os.path.exists("Assets/video_thumb.jpg"):
                     os.remove("Assets/video_thumb.jpg")
+                
+                # Get video metadata
                 duration = (await get_media_info(media_path))[0]
                 thumb = await get_video_thumbnail(media_path, duration)
-                if thumb is not None and thumb != "none":
+                
+                # Get original video dimensions from the message
+                width = chat_message.video.width
+                height = chat_message.video.height
+                
+                # If dimensions are not available in the message, try to get from thumbnail
+                if (not width or not height) and thumb is not None and thumb != "none":
                     with Image.open(thumb) as img:
                         width, height = img.size
-                else:
-                    width = 480
-                    height = 320
+                # Fallback dimensions if all else fails
+                if not width:
+                    width = 640
+                if not height:
+                    height = 360
 
                 if thumb == "none":
                     thumb = None
