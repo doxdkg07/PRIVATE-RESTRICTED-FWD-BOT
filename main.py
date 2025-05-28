@@ -70,6 +70,7 @@ async def download_media(bot: Client, message: Message):
 
     post_url = message.command[1]
     end_message_id = None
+    forward_chat_id = None
     
     # Check if a range is specified
     if len(message.command) >= 3:
@@ -78,16 +79,25 @@ async def download_media(bot: Client, message: Message):
         except ValueError:
             await message.reply("**Invalid end message ID. Please provide a valid number.**")
             return
+    
+    # Check if a forward channel ID is specified
+    if len(message.command) >= 4:
+        try:
+            forward_chat_id = int(message.command[3])
+            LOGGER(__name__).info(f"Content will be forwarded to channel/group ID: {forward_chat_id}")
+        except ValueError:
+            await message.reply("**Invalid channel ID. Please provide a valid number.**")
+            return
 
     try:
         chat_id, start_message_id = getChatMsgID(post_url)
         
         # If no range specified, download single message
         if end_message_id is None:
-            await download_single_message(bot, message, user, chat_id, start_message_id)
+            await download_single_message(bot, message, user, chat_id, start_message_id, forward_chat_id)
         else:
             # Download range of messages
-            await download_message_range(bot, message, user, chat_id, start_message_id, end_message_id)
+            await download_message_range(bot, message, user, chat_id, start_message_id, end_message_id, forward_chat_id)
             
     except (PeerIdInvalid, BadRequest, KeyError):
         await message.reply("**Make sure the user client is part of the chat.**")
@@ -96,7 +106,7 @@ async def download_media(bot: Client, message: Message):
         await message.reply(error_message)
         LOGGER(__name__).error(e)
 
-async def download_single_message(bot: Client, message: Message, user: Client, chat_id, message_id):
+async def download_single_message(bot: Client, message: Message, user: Client, chat_id, message_id, forward_chat_id=None):
     try:
         chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
         if not chat_message:
@@ -105,12 +115,12 @@ async def download_single_message(bot: Client, message: Message, user: Client, c
             
         LOGGER(__name__).info(f"Downloading media from message ID: {message_id}")
         
-        return await process_message(bot, message, user, chat_message)
+        return await process_message(bot, message, user, chat_message, forward_chat_id)
     except Exception as e:
         LOGGER(__name__).error(f"Error downloading message {message_id}: {str(e)}")
         return False
 
-async def download_message_range(bot: Client, message: Message, user: Client, chat_id, start_id, end_id):
+async def download_message_range(bot: Client, message: Message, user: Client, chat_id, start_id, end_id, forward_chat_id=None):
     if start_id > end_id:
         await message.reply("**Start message ID must be less than or equal to end message ID.**")
         return
@@ -140,7 +150,7 @@ async def download_message_range(bot: Client, message: Message, user: Client, ch
                     f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
                 )
             
-            result = await process_message(bot, message, user, chat_message)
+            result = await process_message(bot, message, user, chat_message, forward_chat_id)
             if result:
                 success_count += 1
             else:
@@ -157,7 +167,7 @@ async def download_message_range(bot: Client, message: Message, user: Client, ch
         f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
     )
 
-async def process_message(bot: Client, message: Message, user: Client, chat_message):
+async def process_message(bot: Client, message: Message, user: Client, chat_message, forward_chat_id=None):
     try:
         if chat_message.document or chat_message.video or chat_message.audio:
             file_size = (
@@ -180,8 +190,16 @@ async def process_message(bot: Client, message: Message, user: Client, chat_mess
             chat_message.text or "", chat_message.entities
         )
 
+        # Determine the target chat ID for sending content
+        target_chat_id = forward_chat_id if forward_chat_id else message.chat.id
+        
+        if forward_chat_id:
+            LOGGER(__name__).info(f"Forwarding content to channel/group ID: {forward_chat_id}")
+            # Send a notification to the user that content is being forwarded
+            await message.reply(f"**Forwarding content to channel/group ID: {forward_chat_id}**")
+
         if chat_message.media_group_id:
-            if not await processMediaGroup(chat_message, bot, message):
+            if not await processMediaGroup(chat_message, bot, message, forward_chat_id):
                 await message.reply(
                     "**Could not extract any valid media from the media group.**"
                 )
@@ -209,22 +227,80 @@ async def process_message(bot: Client, message: Message, user: Client, chat_mess
                 if chat_message.audio
                 else "document"
             )
-            await send_media(
-                bot,
-                message,
-                media_path,
-                media_type,
-                parsed_caption,
-                progress_message,
-                start_time,
-            )
+            
+            # Send media to the target chat ID
+            if media_type == "photo":
+                await bot.send_photo(
+                    chat_id=target_chat_id,
+                    photo=media_path,
+                    caption=parsed_caption or "",
+                    progress=Leaves.progress_for_pyrogram,
+                    progress_args=progressArgs(
+                        "📤 Uploading Progress", progress_message, start_time
+                    ),
+                )
+            elif media_type == "video":
+                if os.path.exists("Assets/video_thumb.jpg"):
+                    os.remove("Assets/video_thumb.jpg")
+                duration = (await get_media_info(media_path))[0]
+                thumb = await get_video_thumbnail(media_path, duration)
+                if thumb is not None and thumb != "none":
+                    with Image.open(thumb) as img:
+                        width, height = img.size
+                else:
+                    width = 480
+                    height = 320
+
+                if thumb == "none":
+                    thumb = None
+
+                await bot.send_video(
+                    chat_id=target_chat_id,
+                    video=media_path,
+                    duration=duration,
+                    width=width,
+                    height=height,
+                    thumb=thumb,
+                    caption=parsed_caption or "",
+                    progress=Leaves.progress_for_pyrogram,
+                    progress_args=progressArgs(
+                        "📤 Uploading Progress", progress_message, start_time
+                    ),
+                )
+            elif media_type == "audio":
+                duration, artist, title = await get_media_info(media_path)
+                await bot.send_audio(
+                    chat_id=target_chat_id,
+                    audio=media_path,
+                    duration=duration,
+                    performer=artist,
+                    title=title,
+                    caption=parsed_caption or "",
+                    progress=Leaves.progress_for_pyrogram,
+                    progress_args=progressArgs(
+                        "📤 Uploading Progress", progress_message, start_time
+                    ),
+                )
+            elif media_type == "document":
+                await bot.send_document(
+                    chat_id=target_chat_id,
+                    document=media_path,
+                    caption=parsed_caption or "",
+                    progress=Leaves.progress_for_pyrogram,
+                    progress_args=progressArgs(
+                        "📤 Uploading Progress", progress_message, start_time
+                    ),
+                )
 
             os.remove(media_path)
             await progress_message.delete()
             return True
 
         elif chat_message.text or chat_message.caption:
-            await message.reply(parsed_text or parsed_caption)
+            await bot.send_message(
+                chat_id=target_chat_id,
+                text=parsed_text or parsed_caption
+            )
             return True
         else:
             await message.reply("**No media or text found in the message.**")
@@ -232,6 +308,7 @@ async def process_message(bot: Client, message: Message, user: Client, chat_mess
 
     except Exception as e:
         LOGGER(__name__).error(f"Error processing message: {str(e)}")
+        await message.reply(f"**Error processing message: {str(e)}**")
         return False
 
 
@@ -277,6 +354,7 @@ if __name__ == "__main__":
     try:
         import os
         from flask import Flask, jsonify
+        import threading
         
         # Create a simple Flask app for health checks
         app = Flask(__name__)
@@ -288,20 +366,20 @@ if __name__ == "__main__":
         # Get port from environment variable or use default
         port = int(os.environ.get("PORT", 8000))
         
-        # Start the bot in a separate thread
-        import threading
-        def run_bot():
-            LOGGER(__name__).info("Bot Started!")
-            user.start()
-            bot.run()
+        # Start Flask in a separate thread instead of the bot
+        # This fixes the "signal only works in main thread" error
+        def run_flask():
+            LOGGER(__name__).info(f"Starting web server on port {port}")
+            app.run(host="0.0.0.0", port=port)
         
-        bot_thread = threading.Thread(target=run_bot)
-        bot_thread.daemon = True
-        bot_thread.start()
+        flask_thread = threading.Thread(target=run_flask)
+        flask_thread.daemon = True
+        flask_thread.start()
         
-        # Start Flask app with proper host binding for cloud platforms
-        LOGGER(__name__).info(f"Starting web server on port {port}")
-        app.run(host="0.0.0.0", port=port)
+        # Start the bot in the main thread
+        LOGGER(__name__).info("Bot Started!")
+        user.start()
+        bot.run()
         
     except KeyboardInterrupt:
         pass
