@@ -79,38 +79,31 @@ Estimated Time Left: {est_time} seconds
 def getChatMsgID(link: str):
     linkps = link.split("/")
     chat_id, message_thread_id, message_id = None, None, None
-    
-    try:
-        if len(linkps) == 7 and linkps[3] == "c":
-            # https://t.me/c/1192302355/322/487
+    if len(linkps) == 7 and linkps[3] == "c":
+        # https://t.me/c/1192302355/322/487
+        chat_id = get_channel_id(int(linkps[4]))
+        message_thread_id = int(linkps[5])
+        message_id = int(linkps[6])
+    elif len(linkps) == 6:
+        if linkps[3] == "c":
+            # https://t.me/c/1387666944/609282
             chat_id = get_channel_id(int(linkps[4]))
-            message_thread_id = int(linkps[5])
-            message_id = int(linkps[6])
-        elif len(linkps) == 6:
-            if linkps[3] == "c":
-                # https://t.me/c/1387666944/609282
-                chat_id = get_channel_id(int(linkps[4]))
-                message_id = int(linkps[5])
-            else:
-                # https://t.me/TheForum/322/487
-                chat_id = linkps[3]
-                message_thread_id = int(linkps[4])
-                message_id = int(linkps[5])
-
-        elif len(linkps) == 5:
-            # https://t.me/pyrogramchat/609282
+            message_id = int(linkps[5])
+        else:
+            # https://t.me/TheForum/322/487
             chat_id = linkps[3]
-            if chat_id == "m":
-                raise ValueError("Invalid ClientType used to parse this message link")
-            message_id = int(linkps[4])
+            message_thread_id = int(linkps[4])
+            message_id = int(linkps[5])
 
-    except (ValueError, TypeError):
-        raise ValueError("Invalid post URL. Must end with a numeric ID.")
-
-    if not chat_id or not message_id:
-        raise ValueError("Please send a valid Telegram post URL.")
+    elif len(linkps) == 5:
+        # https://t.me/pyrogramchat/609282
+        chat_id = linkps[3]
+        if chat_id == "m":
+            raise ValueError("Invalid ClientType used to parse this message link")
+        message_id = int(linkps[4])
 
     return chat_id, message_id
+
 
 async def cmd_exec(cmd, shell=False):
     if shell:
