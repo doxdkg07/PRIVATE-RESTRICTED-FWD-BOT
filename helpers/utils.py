@@ -299,14 +299,9 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
                         )
                     )
                 elif msg.video:
-                    # Preserve original video dimensions
-                    width = msg.video.width
-                    height = msg.video.height
                     valid_media.append(
                         InputMediaVideo(
                             media=media_path,
-                            width=width,
-                            height=height,
                             caption=await get_parsed_msg(
                                 msg.caption or "", msg.caption_entities
                             ),
@@ -360,8 +355,6 @@ async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
                         await bot.send_video(
                             chat_id=target_chat_id,
                             video=media.media,
-                            width=getattr(media, 'width', None),
-                            height=getattr(media, 'height', None),
                             caption=media.caption,
                         )
                     elif isinstance(media, InputMediaDocument):
