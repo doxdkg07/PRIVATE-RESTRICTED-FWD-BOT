@@ -3,15 +3,14 @@
 
 import os
 import shutil
-import psutil
-import asyncio
 from time import time
 
-from pyleaves import Leaves
+import psutil
+from pyrogram.types import Message
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, BadRequest
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyleaves import Leaves
 
 from helpers.utils import (
     getChatMsgID,
@@ -40,69 +39,126 @@ bot = Client(
 # Client for user session
 user = Client("user_session", workers=1000, session_string=PyroConf.SESSION_STRING)
 
-RUNNING_TASKS = set()
-
-def track_task(coro):
-    task = asyncio.create_task(coro)
-    RUNNING_TASKS.add(task)
-    def _remove(_):
-        RUNNING_TASKS.discard(task)
-    task.add_done_callback(_remove)
-    return task
 
 @bot.on_message(filters.command("start") & filters.private)
 async def start(_, message: Message):
     welcome_text = (
-        "👋 **Welcome to Media Downloader Bot!**\n\n"
-        "I can grab photos, videos, audio, and documents from any Telegram post.\n"
-        "Just send me a link (paste it directly or use `/dl <link>`),\n"
-        "or reply to a message with `/dl`.\n\n"
-        "ℹ️ Use `/help` to view all commands and examples.\n"
-        "🔒 Make sure the user client is part of the chat.\n\n"
-        "Ready? Send me a Telegram post link!"
+        "**👋 Welcome to the Media Downloader Bot!**\n\n"
+        "This bot helps you download media from Restricted channel\n"
+        "Use /help for more information on how to use this bot."
     )
+    await message.reply(welcome_text)
 
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
-    )
-    await message.reply(welcome_text, reply_markup=markup, disable_web_page_preview=True)
 
 @bot.on_message(filters.command("help") & filters.private)
 async def help_command(_, message: Message):
     help_text = (
-        "💡 **Media Downloader Bot Help**\n\n"
-        "➤ **Download Media**\n"
-        "   – Send `/dl <post_URL>` **or** just paste a Telegram post link to fetch photos, videos, audio, or documents.\n\n"
-        "➤ **Requirements**\n"
-        "   – Make sure the user client is part of the chat.\n\n"
-        "➤ **If the bot hangs**\n"
-        "   – Send `/killall` to cancel any pending downloads.\n\n"
-        "➤ **Logs**\n"
-        "   – Send `/logs` to download the bot’s logs file.\n\n"
-        "➤ **Stats**\n"
-        "   – Send `/stats` to view current status:\n\n"
-        "**Example**:\n"
-        "  • `/dl https://t.me/itsSmartDev/547`\n"
-        "  • `https://t.me/itsSmartDev/547`"
+        "💡 **How to Use the Bot**\n\n"
+        "1. Send the command `/dl post URL` to download media from a specific message.\n"
+        "2. The bot will download the media (photos, videos, audio, or documents) also can copy message.\n"
+        "3. Make sure the bot and the user client are part of the chat to download the media.\n\n"
+        "**Example**: `/dl https://t.me/itsSmartDev/547`"
     )
+    await message.reply(help_text)
+
+
+@bot.on_message(filters.command("dl") & filters.private)
+async def download_media(bot: Client, message: Message):
+    if len(message.command) < 2:
+        await message.reply("**Provide a post URL after the /dl command.**")
+        return
+
+    post_url = message.command[1]
+    end_message_id = None
     
-    markup = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Update Channel", url="https://t.me/itsSmartDev")]]
-    )
-    await message.reply(help_text, reply_markup=markup, disable_web_page_preview=True)
-
-
-async def handle_download(bot: Client, message: Message, post_url: str):
-    # Cut off URL at '?' if present
-    if "?" in post_url:
-        post_url = post_url.split("?", 1)[0]
+    # Check if a range is specified
+    if len(message.command) >= 3:
+        try:
+            end_message_id = int(message.command[2])
+        except ValueError:
+            await message.reply("**Invalid end message ID. Please provide a valid number.**")
+            return
 
     try:
-        chat_id, message_id = getChatMsgID(post_url)
+        chat_id, start_message_id = getChatMsgID(post_url)
+        
+        # If no range specified, download single message
+        if end_message_id is None:
+            await download_single_message(bot, message, user, chat_id, start_message_id)
+        else:
+            # Download range of messages
+            await download_message_range(bot, message, user, chat_id, start_message_id, end_message_id)
+            
+    except (PeerIdInvalid, BadRequest, KeyError):
+        await message.reply("**Make sure the user client is part of the chat.**")
+    except Exception as e:
+        error_message = f"**❌ {str(e)}**"
+        await message.reply(error_message)
+        LOGGER(__name__).error(e)
+
+async def download_single_message(bot: Client, message: Message, user: Client, chat_id, message_id):
+    try:
         chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
+        if not chat_message:
+            await message.reply(f"**Message with ID {message_id} not found.**")
+            return False
+            
+        LOGGER(__name__).info(f"Downloading media from message ID: {message_id}")
+        
+        return await process_message(bot, message, user, chat_message)
+    except Exception as e:
+        LOGGER(__name__).error(f"Error downloading message {message_id}: {str(e)}")
+        return False
 
-        LOGGER(__name__).info(f"Downloading media from URL: {post_url}")
+async def download_message_range(bot: Client, message: Message, user: Client, chat_id, start_id, end_id):
+    if start_id > end_id:
+        await message.reply("**Start message ID must be less than or equal to end message ID.**")
+        return
+        
+    status_message = await message.reply(f"**📥 Downloading messages from {start_id} to {end_id}...**")
+    
+    success_count = 0
+    failed_count = 0
+    skipped_count = 0
+    
+    for msg_id in range(start_id, end_id + 1):
+        try:
+            chat_message = await user.get_messages(chat_id=chat_id, message_ids=msg_id)
+            
+            if not chat_message:
+                LOGGER(__name__).info(f"Message {msg_id} not found, skipping.")
+                skipped_count += 1
+                continue
+                
+            LOGGER(__name__).info(f"Processing message ID: {msg_id}")
+            
+            # Update status periodically
+            if msg_id % 5 == 0 or msg_id == start_id:
+                await status_message.edit(
+                    f"**📥 Downloading messages {start_id} to {end_id}...**\n"
+                    f"**Current: {msg_id}/{end_id}**\n"
+                    f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
+                )
+            
+            result = await process_message(bot, message, user, chat_message)
+            if result:
+                success_count += 1
+            else:
+                failed_count += 1
+                
+        except Exception as e:
+            LOGGER(__name__).error(f"Error processing message {msg_id}: {str(e)}")
+            failed_count += 1
+            continue
+    
+    # Final status update
+    await status_message.edit(
+        f"**✅ Download completed for messages {start_id} to {end_id}**\n"
+        f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
+    )
 
+async def process_message(bot: Client, message: Message, user: Client, chat_message):
+    try:
         if chat_message.document or chat_message.video or chat_message.audio:
             file_size = (
                 chat_message.document.file_size
@@ -115,7 +171,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
             if not await fileSizeLimit(
                 file_size, message, "download", user.me.is_premium
             ):
-                return
+                return False
 
         parsed_caption = await get_parsed_msg(
             chat_message.caption or "", chat_message.caption_entities
@@ -129,7 +185,7 @@ async def handle_download(bot: Client, message: Message, post_url: str):
                 await message.reply(
                     "**Could not extract any valid media from the media group.**"
                 )
-            return
+            return True
 
         elif chat_message.media:
             start_time = time()
@@ -165,34 +221,18 @@ async def handle_download(bot: Client, message: Message, post_url: str):
 
             os.remove(media_path)
             await progress_message.delete()
+            return True
 
         elif chat_message.text or chat_message.caption:
             await message.reply(parsed_text or parsed_caption)
+            return True
         else:
-            await message.reply("**No media or text found in the post URL.**")
+            await message.reply("**No media or text found in the message.**")
+            return False
 
-    except (PeerIdInvalid, BadRequest, KeyError):
-        await message.reply("**Make sure the user client is part of the chat.**")
     except Exception as e:
-        error_message = f"**❌ {str(e)}**"
-        await message.reply(error_message)
-        LOGGER(__name__).error(e)
-
-
-@bot.on_message(filters.command("dl") & filters.private)
-async def download_media(bot: Client, message: Message):
-    if len(message.command) < 2:
-        await message.reply("**Provide a post URL after the /dl command.**")
-        return
-
-    post_url = message.command[1]
-    await track_task(handle_download(bot, message, post_url))
-
-
-@bot.on_message(filters.private & ~filters.command(["start", "help", "dl", "stats", "logs", "killall"]))
-async def handle_any_message(bot: Client, message: Message):
-    if message.text and not message.text.startswith("/"):
-        await track_task(handle_download(bot, message, message.text))
+        LOGGER(__name__).error(f"Error processing message: {str(e)}")
+        return False
 
 
 @bot.on_message(filters.command("stats") & filters.private)
@@ -233,21 +273,37 @@ async def logs(_, message: Message):
         await message.reply("**Not exists**")
 
 
-@bot.on_message(filters.command("killall") & filters.private)
-async def cancel_all_tasks(_, message: Message):
-    cancelled = 0
-    for task in list(RUNNING_TASKS):
-        if not task.done():
-            task.cancel()
-            cancelled += 1
-    await message.reply(f"**Cancelled {cancelled} running task(s).**")
-
-
 if __name__ == "__main__":
     try:
+        import os
+        from flask import Flask, jsonify
+        import threading
+        
+        # Create a simple Flask app for health checks
+        app = Flask(__name__)
+        
+        @app.route('/')
+        def index():
+            return jsonify({"status": "running"})
+        
+        # Get port from environment variable or use default
+        port = int(os.environ.get("PORT", 8000))
+        
+        # Start Flask in a separate thread instead of the bot
+        # This fixes the "signal only works in main thread" error
+        def run_flask():
+            LOGGER(__name__).info(f"Starting web server on port {port}")
+            app.run(host="0.0.0.0", port=port)
+        
+        flask_thread = threading.Thread(target=run_flask)
+        flask_thread.daemon = True
+        flask_thread.start()
+        
+        # Start the bot in the main thread
         LOGGER(__name__).info("Bot Started!")
         user.start()
         bot.run()
+        
     except KeyboardInterrupt:
         pass
     except Exception as err:
