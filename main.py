@@ -4,6 +4,7 @@
 import os
 import shutil
 from time import time
+import asyncio
 
 import psutil
 from pyrogram.types import Message
@@ -11,6 +12,14 @@ from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, BadRequest
 from pyleaves import Leaves
+
+# Enable uvloop for better asyncio performance
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    print("uvloop enabled for better performance")
+except ImportError:
+    print("uvloop not available, using standard asyncio")
 
 from helpers.utils import (
     getChatMsgID,
@@ -21,6 +30,7 @@ from helpers.utils import (
     send_media,
     get_readable_file_size,
     get_readable_time,
+    download_media_with_speed_optimization,
 )
 
 from config import PyroConf
@@ -57,7 +67,9 @@ async def help_command(_, message: Message):
         "1. Send the command `/dl post URL` to download media from a specific message.\n"
         "2. The bot will download the media (photos, videos, audio, or documents) also can copy message.\n"
         "3. Make sure the bot and the user client are part of the chat to download the media.\n\n"
-        "**Example**: `/dl https://t.me/itsSmartDev/547`"
+        "**Example**: `/dl https://t.me/itsSmartDev/547`\n\n"
+        "**Forward to Channel**: `/dl https://t.me/c/2572510647/120 122 -1002694175455`\n"
+        "Where `-1002694175455` is the channel ID to forward content to."
     )
     await message.reply(help_text)
 
@@ -131,14 +143,51 @@ async def download_message_range(bot: Client, message: Message, user: Client, ch
     failed_count = 0
     skipped_count = 0
     
+    # Use a semaphore to limit concurrent downloads
+    semaphore = asyncio.Semaphore(3)  # Allow 3 concurrent downloads
+    tasks = []
+    
     for msg_id in range(start_id, end_id + 1):
+        # Create a task for each message download
+        task = asyncio.create_task(
+            process_message_with_semaphore(
+                semaphore, bot, message, user, chat_id, msg_id, 
+                forward_chat_id, status_message, start_id, end_id,
+                success_count, failed_count, skipped_count
+            )
+        )
+        tasks.append(task)
+    
+    # Wait for all tasks to complete
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # Count results
+    for result in results:
+        if isinstance(result, tuple):
+            status, _ = result
+            if status == "success":
+                success_count += 1
+            elif status == "failed":
+                failed_count += 1
+            elif status == "skipped":
+                skipped_count += 1
+    
+    # Final status update
+    await status_message.edit(
+        f"**✅ Download completed for messages {start_id} to {end_id}**\n"
+        f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
+    )
+
+async def process_message_with_semaphore(semaphore, bot, message, user, chat_id, msg_id, 
+                                        forward_chat_id, status_message, start_id, end_id,
+                                        success_count, failed_count, skipped_count):
+    async with semaphore:  # This limits concurrent downloads
         try:
             chat_message = await user.get_messages(chat_id=chat_id, message_ids=msg_id)
             
             if not chat_message:
                 LOGGER(__name__).info(f"Message {msg_id} not found, skipping.")
-                skipped_count += 1
-                continue
+                return "skipped", msg_id
                 
             LOGGER(__name__).info(f"Processing message ID: {msg_id}")
             
@@ -152,20 +201,13 @@ async def download_message_range(bot: Client, message: Message, user: Client, ch
             
             result = await process_message(bot, message, user, chat_message, forward_chat_id)
             if result:
-                success_count += 1
+                return "success", msg_id
             else:
-                failed_count += 1
+                return "failed", msg_id
                 
         except Exception as e:
             LOGGER(__name__).error(f"Error processing message {msg_id}: {str(e)}")
-            failed_count += 1
-            continue
-    
-    # Final status update
-    await status_message.edit(
-        f"**✅ Download completed for messages {start_id} to {end_id}**\n"
-        f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
-    )
+            return "failed", msg_id
 
 async def process_message(bot: Client, message: Message, user: Client, chat_message, forward_chat_id=None):
     try:
@@ -209,12 +251,21 @@ async def process_message(bot: Client, message: Message, user: Client, chat_mess
             start_time = time()
             progress_message = await message.reply("**📥 Downloading Progress...**")
 
-            media_path = await chat_message.download(
-                progress=Leaves.progress_for_pyrogram,
-                progress_args=progressArgs(
-                    "📥 Downloading Progress", progress_message, start_time
-                ),
-            )
+            # Use optimized download function for videos and documents (PDFs)
+            if chat_message.video or (chat_message.document and chat_message.document.mime_type == "application/pdf"):
+                media_path = await download_media_with_speed_optimization(
+                    chat_message,
+                    progress_message=progress_message,
+                    start_time=start_time
+                )
+            else:
+                # Use standard download for other media types
+                media_path = await chat_message.download(
+                    progress=Leaves.progress_for_pyrogram,
+                    progress_args=progressArgs(
+                        "📥 Downloading Progress", progress_message, start_time
+                    ),
+                )
 
             LOGGER(__name__).info(f"Downloaded media: {media_path}")
 
