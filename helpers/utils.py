@@ -261,7 +261,7 @@ async def send_media(
         )
 
 
-async def processMediaGroup(chat_message, bot, message):
+async def processMediaGroup(chat_message, bot, message, forward_chat_id=None):
     media_group_messages = await chat_message.get_media_group()
     valid_media = []
     temp_paths = []
@@ -272,6 +272,12 @@ async def processMediaGroup(chat_message, bot, message):
     LOGGER(__name__).info(
         f"Downloading media group with {len(media_group_messages)} items..."
     )
+
+    # Determine the target chat ID for sending content
+    target_chat_id = forward_chat_id if forward_chat_id else message.chat.id
+    
+    if forward_chat_id:
+        LOGGER(__name__).info(f"Media group will be forwarded to channel/group ID: {forward_chat_id}")
 
     for msg in media_group_messages:
         if msg.photo or msg.video or msg.document or msg.audio:
@@ -331,9 +337,10 @@ async def processMediaGroup(chat_message, bot, message):
 
     if valid_media:
         try:
-            await bot.send_media_group(chat_id=message.chat.id, media=valid_media)
+            await bot.send_media_group(chat_id=target_chat_id, media=valid_media)
             await progress_message.delete()
-        except Exception:
+        except Exception as e:
+            LOGGER(__name__).error(f"Failed to send media group: {e}")
             await message.reply(
                 "**❌ Failed to send media group, trying individual uploads**"
             )
@@ -341,31 +348,31 @@ async def processMediaGroup(chat_message, bot, message):
                 try:
                     if isinstance(media, InputMediaPhoto):
                         await bot.send_photo(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             photo=media.media,
                             caption=media.caption,
                         )
                     elif isinstance(media, InputMediaVideo):
                         await bot.send_video(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             video=media.media,
                             caption=media.caption,
                         )
                     elif isinstance(media, InputMediaDocument):
                         await bot.send_document(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             document=media.media,
                             caption=media.caption,
                         )
                     elif isinstance(media, InputMediaAudio):
                         await bot.send_audio(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             audio=media.media,
                             caption=media.caption,
                         )
                     elif isinstance(media, Voice):
                         await bot.send_voice(
-                            chat_id=message.chat.id,
+                            chat_id=target_chat_id,
                             voice=media.media,
                             caption=media.caption,
                         )
