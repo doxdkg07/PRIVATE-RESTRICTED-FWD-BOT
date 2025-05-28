@@ -277,7 +277,6 @@ if __name__ == "__main__":
     try:
         import os
         from flask import Flask, jsonify
-        import threading
         
         # Create a simple Flask app for health checks
         app = Flask(__name__)
@@ -289,20 +288,20 @@ if __name__ == "__main__":
         # Get port from environment variable or use default
         port = int(os.environ.get("PORT", 8000))
         
-        # Start Flask in a separate thread instead of the bot
-        # This fixes the "signal only works in main thread" error
-        def run_flask():
-            LOGGER(__name__).info(f"Starting web server on port {port}")
-            app.run(host="0.0.0.0", port=port)
+        # Start the bot in a separate thread
+        import threading
+        def run_bot():
+            LOGGER(__name__).info("Bot Started!")
+            user.start()
+            bot.run()
         
-        flask_thread = threading.Thread(target=run_flask)
-        flask_thread.daemon = True
-        flask_thread.start()
+        bot_thread = threading.Thread(target=run_bot)
+        bot_thread.daemon = True
+        bot_thread.start()
         
-        # Start the bot in the main thread
-        LOGGER(__name__).info("Bot Started!")
-        user.start()
-        bot.run()
+        # Start Flask app with proper host binding for cloud platforms
+        LOGGER(__name__).info(f"Starting web server on port {port}")
+        app.run(host="0.0.0.0", port=port)
         
     except KeyboardInterrupt:
         pass
