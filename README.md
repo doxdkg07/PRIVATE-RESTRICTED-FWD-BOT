@@ -1,5 +1,3 @@
-<h1 align="center">Restricted Content Downloader Telegram Bot</h1>
-
 ## Features
 
 - 📥 Download media (photos, videos, audio, documents).
