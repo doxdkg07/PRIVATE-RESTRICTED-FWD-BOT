@@ -19,7 +19,7 @@
 - **`/start`** – Welcomes you and gives a brief introduction.  
 - **`/help`** – Shows detailed instructions and examples.  
 - **`/dl <post_URL> <range upto> <channel id>`** or simply paste a Telegram post link – Fetch photos, videos, audio, or documents from that post.  
-- **`/killall`** – Cancel any pending downloads if the bot hangs.  
+- **`/cancel`** – Cancel any pending downloads if the bot hangs.  
 - **`/logs`** – Download the bot’s logs file.  
 - **`/stats`** – View current status (uptime, disk, memory, network, CPU, etc.).
 
