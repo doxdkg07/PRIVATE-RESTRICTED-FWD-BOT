@@ -25,7 +25,6 @@
 
 ### Examples
 - `/dl https://t.me/566555/547 530 -1002695709891`  
-- `https://t.me/666666/547`
 
 > **Note:** Make sure both this bot and your user session are members of the source chat or channel before downloading.  
 
