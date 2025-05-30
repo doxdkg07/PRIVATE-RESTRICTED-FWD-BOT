@@ -11,7 +11,7 @@
 2. Replace the placeholders for `API_ID`, `API_HASH`, `SESSION_STRING`, and `BOT_TOKEN` with your actual values:
    - **`API_ID`**: Your API ID from [my.telegram.org](https://my.telegram.org).
    - **`API_HASH`**: Your API Hash from [my.telegram.org](https://my.telegram.org).
-   - **`SESSION_STRING`**: The session string generated using [session-string-generator](https://telegram.tools/session-string-generator)).
+   - **`SESSION_STRING`**: The session string generated using [session-string-generator](https://telegram.tools/session-string-generator).
    - **`BOT_TOKEN`**: The token you obtained from [@BotFather](https://t.me/BotFather).
 
 ## Usage
