@@ -9,7 +9,7 @@ from pyrogram.types import Message
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
 from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait # Added FloodWait
-from pyleaves import Leaves
+# from pyleaves import Leaves # Removed as progress is handled differently or removed
 # from PIL import Image # No longer needed here if relying on pyrogram defaults
 
 from helpers.utils import (
@@ -29,13 +29,17 @@ from helpers.utils import (
 from config import PyroConf
 from logger import LOGGER
 
+# --- Configuration --- 
+# Default worker count if not specified in config (can be overridden by env var if needed)
+DEFAULT_WORKERS = int(os.getenv("PYROGRAM_WORKERS", "200"))
+
 # Initialize the bot client
 bot = Client(
     "media_bot",
     api_id=PyroConf.API_ID,
     api_hash=PyroConf.API_HASH,
     bot_token=PyroConf.BOT_TOKEN,
-    workers=PyroConf.WORKERS, # Use config value
+    workers=DEFAULT_WORKERS, # Use default worker count
     parse_mode=ParseMode.MARKDOWN,
 )
 
@@ -44,7 +48,7 @@ user = Client(
     "user_session",
     api_id=PyroConf.API_ID, # Use same API creds
     api_hash=PyroConf.API_HASH,
-    workers=PyroConf.WORKERS, # Use config value
+    workers=DEFAULT_WORKERS, # Use default worker count
     session_string=PyroConf.SESSION_STRING
 )
 
@@ -564,5 +568,4 @@ if __name__ == "__main__":
         if bot.is_connected:
             bot.stop()
         LOGGER(__name__).info("Clients stopped. Exiting.")
-
 
