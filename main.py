@@ -1,29 +1,29 @@
 
-
 import os
 import shutil
-import asyncio
 from time import time
+import asyncio # Added for concurrency
 
 import psutil
 from pyrogram.types import Message
 from pyrogram.enums import ParseMode
 from pyrogram import Client, filters
-from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait
+from pyrogram.errors import PeerIdInvalid, BadRequest, FloodWait # Added FloodWait
 from pyleaves import Leaves
-from PIL import Image
+# from PIL import Image # No longer needed here if relying on pyrogram defaults
 
 from helpers.utils import (
     getChatMsgID,
-    processMediaGroup,
+    # processMediaGroup, # Will be modified/called differently
     get_parsed_msg,
     fileSizeLimit,
     progressArgs,
-    # send_media, # This helper seems unused, removing import
+    # send_media, # Removed
     get_readable_file_size,
     get_readable_time,
-    get_media_info,
-    get_video_thumbnail,
+    # get_media_info, # Removed if not needed for fallback
+    # get_video_thumbnail, # Removed
+    processMediaGroup # Keep the import, will modify the function itself later
 )
 
 from config import PyroConf
@@ -35,23 +35,27 @@ bot = Client(
     api_id=PyroConf.API_ID,
     api_hash=PyroConf.API_HASH,
     bot_token=PyroConf.BOT_TOKEN,
-    workers=1000,
+    workers=PyroConf.WORKERS, # Use config value
     parse_mode=ParseMode.MARKDOWN,
 )
 
 # Client for user session
-user = Client("user_session", workers=1000, session_string=PyroConf.SESSION_STRING)
-
-# Dictionary to track ongoing tasks per user
-ongoing_tasks = {}  # Key: user_id, Value: {"cancel": False, "message": status_message_object (optional), "flood_stop": False}
+user = Client(
+    "user_session",
+    api_id=PyroConf.API_ID, # Use same API creds
+    api_hash=PyroConf.API_HASH,
+    workers=PyroConf.WORKERS, # Use config value
+    session_string=PyroConf.SESSION_STRING
+)
 
 
 @bot.on_message(filters.command("start") & filters.private)
 async def start(_, message: Message):
     welcome_text = (
-        "**👋 Welcome to the Media Downloader Bot!**\n\n"
-        "This bot helps you download media from Restricted channel\n"
-        "Use /help for more information on how to use this bot."
+        "**👋 Welcome to the Optimized Media Forwarder Bot!**\n\n"
+        "This bot helps you forward media from restricted channels faster.\n"
+        "It prioritizes direct copying and uses concurrent processing for ranges.\n\n"
+        "Use /help for more information."
     )
     await message.reply(welcome_text)
 
@@ -60,542 +64,505 @@ async def start(_, message: Message):
 async def help_command(_, message: Message):
     help_text = (
         "💡 **How to Use the Bot**\n\n"
-        "1. Send the command `/dl post URL` to download media from a specific message.\n"
-        "2. Send the command `/dl post_URL start_ID end_ID` to download a range of messages.\n"
-        "3. Add a channel ID at the end to forward content: `/dl post_URL [end_ID] channel_ID`\n"
-        "4. Use `/cancel` to stop any ongoing download/forwarding task initiated by you.\n"
-        "5. The bot will download the media (photos, videos, audio, or documents) or copy messages.\n"
-        "6. Make sure the bot and the user client are part of the source chat to download the media.\n"
-        "7. **Flood Errors:** If the bot encounters repeated Telegram flood limits, the task will be automatically stopped.\n\n"
-        "**Example (Single Post)**: `/dl https://t.me/itsSmartDev/547`\n"
-        "**Example (Range)**: `/dl https://t.me/c/2572510647/120 150`\n"
-        "**Example (Forward to Channel)**: `/dl https://t.me/c/2572510647/120 -1002694175455`\n"
-        "**Example (Range & Forward)**: `/dl https://t.me/c/2572510647/120 150 -1002694175455`"
+        "1. Send `/dl post_URL [end_URL_or_ID] [target_chat_id]`\n"
+        "   - `post_URL`: Link to the first message.\n"
+        "   - `end_URL_or_ID` (Optional): Link or ID of the last message for a range.\n"
+        "   - `target_chat_id` (Optional): Channel/Group ID to forward to (e.g., -100xxxxxxxxxx). If omitted, sends to you.\n\n"
+        "2. The bot will copy/forward the specified message(s).\n"
+        "3. Make sure the **User Account** (not the bot) is a member of the source chat.\n\n"
+        "**Examples:**\n"
+        "  `/dl https://t.me/some/channel/123` (Single message to you)\n"
+        "  `/dl https://t.me/c/12345/10 20` (Messages 10-20 to you)\n"
+        "  `/dl https://t.me/c/12345/10 https://t.me/c/12345/20 -100987654321` (Range 10-20 forwarded)\n"
+        "  `/dl https://t.me/c/12345/10 -100987654321` (Single message forwarded)"
+
     )
     await message.reply(help_text)
 
 
-@bot.on_message(filters.command("cancel") & filters.private)
-async def cancel_command(_, message: Message):
-    user_id = message.from_user.id
-    if user_id in ongoing_tasks and not ongoing_tasks[user_id]["cancel"]:
-        ongoing_tasks[user_id]["cancel"] = True
-        await message.reply("**Attempting to cancel your ongoing task...**")
-        status_msg = ongoing_tasks[user_id].get("message")
-        if status_msg:
-            try:
-                await status_msg.edit("**⚠️ Task cancellation requested...**")
-            except Exception as e:
-                LOGGER(__name__).warning(f"Could not edit status message during cancel: {e}")
-    else:
-        await message.reply("**You have no active task to cancel.**")
-
-
-async def handle_flood_wait(fw: FloodWait, user_id: int, message: Message, status_message: Message = None):
-    """Handles FloodWait exceptions by notifying the user and stopping the task."""
-    LOGGER(__name__).error(f"Flood wait encountered for user {user_id}: {fw}")
-    wait_time = fw.value
-    error_text = f"**🛑 Flood Limit Error!**\nTelegram requires a wait of {wait_time} seconds. The current task has been automatically stopped to prevent further issues. Please try again later."
-    
-    # Try editing status message first, then reply to original command message
-    if status_message:
-        try:
-            await status_message.edit(error_text)
-        except Exception:
-            await message.reply(error_text)
-    else:
-        await message.reply(error_text)
-        
-    # Mark task for cancellation/stop
-    if user_id in ongoing_tasks:
-        ongoing_tasks[user_id]["cancel"] = True
-        ongoing_tasks[user_id]["flood_stop"] = True # Mark specifically as flood stopped
-
-
 @bot.on_message(filters.command("dl") & filters.private)
-async def download_media(bot: Client, message: Message):
-    user_id = message.from_user.id
-
-    if user_id in ongoing_tasks:
-        await message.reply("**You already have an ongoing task. Please wait for it to complete or use /cancel.**")
-        return
-
+async def download_media_command(bot: Client, message: Message):
     if len(message.command) < 2:
-        await message.reply("**Provide a post URL after the /dl command. Use /help for details.**")
+        await message.reply("**Usage:** `/dl post_URL [end_URL_or_ID] [target_chat_id]`")
         return
 
-    post_url = message.command[1]
-    end_message_id = None
+    start_url = message.command[1]
+    end_ref = None
     forward_chat_id = None
+    target_chat_id_int = None # Parsed target chat ID
 
-    # Parse arguments: URL [End_ID] [Forward_ID]
+    # Parse arguments flexibly
     if len(message.command) >= 3:
-        try:
-            potential_id = int(message.command[2])
-            if potential_id < 0:
-                forward_chat_id = potential_id
-            else:
-                end_message_id = potential_id
-        except ValueError:
-            await message.reply("**Invalid End Message ID or Forward Channel ID. Please provide valid numbers.**")
-            return
+        # Is the 3rd arg a target chat ID (starts with -)?
+        if message.command[2].startswith("-") and message.command[2][1:].isdigit():
+            forward_chat_id = message.command[2]
+        else:
+            end_ref = message.command[2] # Assume it's the end message ref
 
     if len(message.command) >= 4:
-        try:
-            if end_message_id is not None:
-                 forward_chat_id = int(message.command[3])
-            else:
-                 await message.reply("**Invalid command structure. Use /help for details.**")
-                 return
-        except (ValueError, IndexError):
-            await message.reply("**Invalid Forward Channel ID. Please provide a valid number.**")
-            return
-
-    if forward_chat_id:
-         LOGGER(__name__).info(f"Content will be forwarded to channel/group ID: {forward_chat_id}")
-
-    try:
-        chat_id, start_message_id = getChatMsgID(post_url)
-
-        # Initialize task tracking
-        ongoing_tasks[user_id] = {"cancel": False, "message": None, "flood_stop": False}
-
-        if end_message_id is None:
-            await download_single_message(bot, message, user, chat_id, start_message_id, forward_chat_id, user_id)
+         # If we already have end_ref, 4th arg must be target_chat_id
+        if end_ref and message.command[3].startswith("-") and message.command[3][1:].isdigit():
+             forward_chat_id = message.command[3]
+        # If we didn't have end_ref, but 3rd arg wasn't target_id, then 3rd was end_ref and 4th is target_id
+        elif not end_ref and not forward_chat_id and message.command[3].startswith("-") and message.command[3][1:].isdigit():
+             end_ref = message.command[2] # Re-assign 3rd arg as end_ref
+             forward_chat_id = message.command[3]
         else:
-            await download_message_range(bot, message, user, chat_id, start_message_id, end_message_id, forward_chat_id, user_id)
+             await message.reply("**Invalid argument order.** Use `/dl start [end] [target_id]`")
+             return
 
-    except FloodWait as fw:
-        # Catch flood wait during initial setup (e.g., getChatMsgID if it uses API)
-        await handle_flood_wait(fw, user_id, message)
-    except (PeerIdInvalid, BadRequest, KeyError):
-        await message.reply("**Make sure the user client is part of the chat.**")
-    except Exception as e:
-        error_message = f"**❌ An error occurred: {str(e)}**"
-        await message.reply(error_message)
-        LOGGER(__name__).error(f"Error in /dl command for user {user_id}: {e}", exc_info=True)
-    finally:
-        # Clean up task tracking only if it exists
-        if user_id in ongoing_tasks:
-            del ongoing_tasks[user_id]
+    # Validate and parse target_chat_id
+    if forward_chat_id:
+        try:
+            target_chat_id_int = int(forward_chat_id)
+            LOGGER(__name__).info(f"Forwarding requested to target chat ID: {target_chat_id_int}")
+        except ValueError:
+            await message.reply("**Invalid target_chat_id. Must be a number (usually starting with -100).**")
+            return
+    else:
+        # Default to user's chat if no target_chat_id provided
+        target_chat_id_int = message.chat.id
+        LOGGER(__name__).info(f"No target chat ID provided. Sending to user chat: {target_chat_id_int}")
 
-async def download_single_message(bot: Client, message: Message, user: Client, chat_id, message_id, forward_chat_id, user_id):
-    if user_id in ongoing_tasks and ongoing_tasks[user_id]["cancel"]:
-        LOGGER(__name__).info(f"Task cancelled by user {user_id} before processing message {message_id}")
-        # Don't send another message if it was a flood stop
-        if not ongoing_tasks[user_id].get("flood_stop", False):
-            await message.reply("**Task cancelled.**")
-        return False
-        
+
     try:
+        start_chat_id, start_message_id = getChatMsgID(start_url)
+        end_message_id = None
+
+        if end_ref:
+            # Try parsing end_ref as URL first
+            try:
+                 _, end_message_id = getChatMsgID(end_ref)
+            except ValueError:
+                 # If not a valid URL, try parsing as a direct message ID
+                 try:
+                     end_message_id = int(end_ref)
+                 except ValueError:
+                     await message.reply("**Invalid end_message reference. Use a message URL or ID.**")
+                     return
+
+        # Ensure chat IDs match if end_ref was a URL
+        # (getChatMsgID doesn't return chat_id if input is just an ID)
+        # We assume the user provides IDs from the same chat as the start_url
+
+        if end_message_id is not None and end_message_id < start_message_id:
+             await message.reply("**End message ID must be greater than or equal to start message ID.**")
+             return
+
+        # --- Trigger Processing ---
+        if end_message_id is None:
+            # Single message processing
+            await process_single_message(bot, message, user, start_chat_id, start_message_id, target_chat_id_int)
+        else:
+            # Range message processing (now concurrent)
+            await process_message_range(bot, message, user, start_chat_id, start_message_id, end_message_id, target_chat_id_int)
+
+    except (ValueError, PeerIdInvalid, BadRequest) as e:
+        await message.reply(f"**Error parsing link or accessing chat:** {e}. Make sure the link is correct and the **User Account** is in the source chat.")
+    except FloodWait as e:
+        await message.reply(f"**Rate limit hit. Please wait {e.value} seconds and try again.**")
+        await asyncio.sleep(e.value)
+    except Exception as e:
+        error_message = f"**❌ An unexpected error occurred: {str(e)}**"
+        await message.reply(error_message)
+        LOGGER(__name__).error(f"Unexpected error in download_media_command: {e}", exc_info=True)
+
+
+# Renamed from download_single_message for clarity
+async def process_single_message(bot: Client, cmd_message: Message, user: Client, chat_id, message_id, target_chat_id):
+    """Fetches and processes a single message."""
+    log_prefix = f"[MsgID: {message_id}]"
+    try:
+        # Use user client to get message from restricted channel
         chat_message = await user.get_messages(chat_id=chat_id, message_ids=message_id)
         if not chat_message:
-            await message.reply(f"**Message with ID {message_id} not found.**")
+            await cmd_message.reply(f"**{log_prefix} Message not found.**")
             return False
 
-        LOGGER(__name__).info(f"Processing single message ID: {message_id} for user {user_id}")
-        return await process_message(bot, message, user, chat_message, forward_chat_id, user_id)
-        
-    except FloodWait as fw:
-        await handle_flood_wait(fw, user_id, message)
-        return False # Indicate failure due to flood wait
+        LOGGER(__name__).info(f"{log_prefix} Processing single message.")
+        return await process_message_content(bot, cmd_message, user, chat_message, target_chat_id)
+
+    except FloodWait as e:
+        LOGGER(__name__).warning(f"{log_prefix} FloodWait: waiting {e.value}s")
+        await cmd_message.reply(f"**Rate limit hit. Waiting {e.value} seconds...**")
+        await asyncio.sleep(e.value)
+        return await process_single_message(bot, cmd_message, user, chat_id, message_id, target_chat_id) # Retry
     except Exception as e:
-        LOGGER(__name__).error(f"Error downloading single message {message_id} for user {user_id}: {str(e)}")
-        await message.reply(f"**Error processing message {message_id}: {str(e)}**")
+        LOGGER(__name__).error(f"{log_prefix} Error fetching/processing single message: {str(e)}", exc_info=True)
+        await cmd_message.reply(f"**{log_prefix} Error processing message: {str(e)}**")
         return False
 
-async def download_message_range(bot: Client, message: Message, user: Client, chat_id, start_id, end_id, forward_chat_id, user_id):
+
+# Renamed and refactored for concurrency
+async def process_message_range(bot: Client, cmd_message: Message, user: Client, chat_id, start_id, end_id, target_chat_id):
+    """Fetches and processes a range of messages concurrently."""
     if start_id > end_id:
-        await message.reply("**Start message ID must be less than or equal to end message ID.**")
+        await cmd_message.reply("**Start message ID must be less than or equal to end message ID.**")
         return
 
-    status_message = None
-    try:
-        status_message = await message.reply(f"**📥 Preparing to download messages from {start_id} to {end_id}...**")
-        if user_id in ongoing_tasks:
-            ongoing_tasks[user_id]["message"] = status_message
-    except FloodWait as fw_status:
-        # Handle flood wait even when sending the initial status message
-        await handle_flood_wait(fw_status, user_id, message)
-        return # Stop the task immediately
-    except Exception as e_status:
-        LOGGER(__name__).error(f"Error sending initial status message for user {user_id}: {e_status}")
-        await message.reply(f"**Error starting task: {e_status}**")
-        # Ensure task is marked as stopped if it was created
-        if user_id in ongoing_tasks:
-             ongoing_tasks[user_id]["cancel"] = True 
-        return
+    total_messages = end_id - start_id + 1
+    status_message = await cmd_message.reply(f"**🚀 Starting processing for {total_messages} messages ({start_id} to {end_id})...**")
 
     success_count = 0
     failed_count = 0
-    skipped_count = 0
-    cancelled = False # Tracks user cancel or flood stop
+    skipped_count = 0 # Not actively used currently, failure covers skips
+    processed_count = 0
 
-    for msg_id in range(start_id, end_id + 1):
-        # Check for cancellation/stop at the start of each iteration
-        if user_id in ongoing_tasks and ongoing_tasks[user_id]["cancel"]:
-            LOGGER(__name__).info(f"Task stopped/cancelled by user {user_id} during range processing at message {msg_id}")
-            cancelled = True
-            break
-            
-        try:
-            # Fetch message
-            chat_message = await user.get_messages(chat_id=chat_id, message_ids=msg_id)
+    # --- Concurrency Control ---
+    CONCURRENCY_LIMIT = 10 # Adjust as needed based on performance/rate limits
+    semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-            if not chat_message:
-                LOGGER(__name__).info(f"Message {msg_id} not found, skipping.")
-                skipped_count += 1
-                await asyncio.sleep(0.5) # Shorter sleep for skipped messages
-                continue
+    tasks = []
+    message_ids_to_fetch = list(range(start_id, end_id + 1))
 
-            LOGGER(__name__).info(f"Processing message ID: {msg_id} in range for user {user_id}")
+    # --- Media Group Tracking --- 
+    # To avoid processing/copying each item of a group individually multiple times
+    processed_media_groups = set()
 
-            # Update status periodically
-            if msg_id % 10 == 0 or msg_id == start_id: # Update less frequently
-                if cancelled: break
-                try:
-                    await status_message.edit(
-                        f"**📥 Downloading messages {start_id} to {end_id}...**\n"
-                        f"**Current: {msg_id}/{end_id}**\n"
-                        f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
-                    )
-                except FloodWait as fw_edit:
-                    # If editing status message gets flood waited, log it but continue the main task
-                    LOGGER(__name__).warning(f"Flood wait editing status message for user {user_id}: {fw_edit}. Pausing edit.")
-                    await asyncio.sleep(fw_edit.value + 2)
-                except Exception as edit_err:
-                    LOGGER(__name__).warning(f"Could not edit status message for user {user_id}: {edit_err}")
-
-            # Process message
-            if cancelled: break
-            result = await process_message(bot, message, user, chat_message, forward_chat_id, user_id)
-            
-            # Check if process_message caused a flood stop
-            if user_id in ongoing_tasks and ongoing_tasks[user_id].get("flood_stop", False):
-                 LOGGER(__name__).info(f"Flood stop detected after process_message for user {user_id} at msg {msg_id}")
-                 cancelled = True
-                 break # Exit loop immediately after flood stop
-                 
-            if result:
-                success_count += 1
-            else:
-                # If process_message returned False but wasn't a flood stop, count as failed/skipped
-                failed_count += 1
-            
-            # Check cancellation status again before sleeping
-            if user_id in ongoing_tasks and ongoing_tasks[user_id]["cancel"]:
-                cancelled = True
-                break
+    async def process_with_semaphore(msg_id):
+        """Wrapper to manage semaphore and process message content."""
+        nonlocal success_count, failed_count, processed_count, processed_media_groups
+        log_prefix = f"[MsgID: {msg_id}]"
+        async with semaphore:
+            try:
+                # Fetch message using user client
+                # TODO: Consider fetching messages in batches for efficiency?
+                chat_message = await user.get_messages(chat_id=chat_id, message_ids=msg_id)
                 
-            await asyncio.sleep(PyroConf.SLEEP_TIMER) # Use configured sleep timer
+                if not chat_message:
+                    LOGGER(__name__).info(f"{log_prefix} Message not found or skipped.")
+                    failed_count += 1 # Count as failed if not found
+                    
+                # --- Media Group Handling within Range --- 
+                elif chat_message.media_group_id:
+                    group_id = chat_message.media_group_id
+                    if group_id in processed_media_groups:
+                        LOGGER(__name__).info(f"{log_prefix} Belongs to already processed media group {group_id}. Skipping.")
+                        # Don't increment success/fail here, it was handled by the first message of the group
+                    else:
+                        LOGGER(__name__).info(f"{log_prefix} First message of media group {group_id}. Processing group.")
+                        # Process the entire media group using the dedicated function
+                        # This function should attempt copy_media_group first
+                        result = await processMediaGroup(chat_message, bot, cmd_message, user, target_chat_id)
+                        if result:
+                            success_count += 1 # Count group as one success
+                        else:
+                            failed_count += 1 # Count group as one failure
+                        processed_media_groups.add(group_id) # Mark group as processed
+                
+                # --- Process Single Message (Non-Media Group) --- 
+                else:
+                    LOGGER(__name__).info(f"{log_prefix} Processing non-group message content.")
+                    result = await process_message_content(bot, cmd_message, user, chat_message, target_chat_id)
+                    if result:
+                        success_count += 1
+                    else:
+                        failed_count += 1
 
-        except FloodWait as fw:
-            await handle_flood_wait(fw, user_id, message, status_message)
-            cancelled = True # Mark as cancelled to stop the loop
-            break # Exit loop immediately
-        except Exception as e:
-            LOGGER(__name__).error(f"Error processing message {msg_id} in range for user {user_id}: {str(e)}")
-            failed_count += 1
-            await asyncio.sleep(2) # Short sleep on general error
-            continue # Continue to next message if possible
+            except FloodWait as e:
+                LOGGER(__name__).warning(f"{log_prefix} FloodWait during range processing: waiting {e.value}s")
+                await asyncio.sleep(e.value + 1) # Wait a bit longer
+                # For simplicity, count as failed and let user retry range if needed.
+                failed_count += 1
+            except Exception as e:
+                LOGGER(__name__).error(f"{log_prefix} Error processing message in range: {str(e)}", exc_info=True)
+                failed_count += 1
+            finally:
+                processed_count += 1
+                # --- Update Status Periodically --- 
+                # Update more frequently initially, then less often
+                update_interval = 10 if processed_count < 100 else 50 if processed_count < 1000 else 100
+                if processed_count % update_interval == 0 or processed_count == total_messages:
+                     try:
+                         # Calculate remaining tasks more accurately
+                         remaining_tasks = total_messages - processed_count
+                         await status_message.edit(
+                             f"**Processing: {processed_count}/{total_messages} messages ({start_id}-{end_id})**\n"
+                             f"**Target: `{target_chat_id}`**\n"
+                             f"**Success: {success_count} | Failed: {failed_count}**\n"
+                             f"*(~{remaining_tasks} remaining, {CONCURRENCY_LIMIT} concurrent)*"
+                         )
+                     except FloodWait as e:
+                         LOGGER(__name__).warning(f"FloodWait while editing status: {e.value}s")
+                         await asyncio.sleep(e.value + 1)
+                     except Exception as edit_err:
+                         # Ignore frequent errors like MessageNotModified
+                         if "MessageNotModified" not in str(edit_err):
+                              LOGGER(__name__).error(f"Error editing status message: {edit_err}")
+
+
+    # Create tasks for all message IDs
+    tasks = [asyncio.create_task(process_with_semaphore(msg_id)) for msg_id in message_ids_to_fetch]
+
+    # Wait for all tasks to complete
+    await asyncio.gather(*tasks)
 
     # Final status update
-    if status_message:
-        is_flood_stop = ongoing_tasks.get(user_id, {}).get("flood_stop", False)
-        final_prefix = "🛑 Task Stopped (Flood Error)" if is_flood_stop else ("⚠️ Task Cancelled" if cancelled else "✅ Task Completed")
-        final_text = f"**{final_prefix} for messages {start_id} to {end_id}**\n"
-        final_text += f"**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**"
-        try:
-            await status_message.edit(final_text)
-        except Exception as final_edit_err:
-             LOGGER(__name__).warning(f"Could not edit final status message for user {user_id}: {final_edit_err}")
-             # Send as new message if editing failed, but avoid double notification on flood stop
-             if not is_flood_stop:
-                 await message.reply(final_text)
-    elif cancelled:
-         # If status message failed initially but task was cancelled later
-         is_flood_stop = ongoing_tasks.get(user_id, {}).get("flood_stop", False)
-         if not is_flood_stop:
-              await message.reply(f"**⚠️ Task Cancelled for messages {start_id} to {end_id}**\n**Success: {success_count} | Failed: {failed_count} | Skipped: {skipped_count}**")
-
-async def process_message(bot: Client, message: Message, user: Client, chat_message, forward_chat_id, user_id):
-    media_path = None
-    thumb_path = None
-    progress_message = None
-    
+    final_text = (
+        f"**✅ Processing completed for messages {start_id} to {end_id}**\n"
+        f"**Target: `{target_chat_id}`**\n"
+        f"**Total Attempted: {total_messages} | Success: {success_count} | Failed: {failed_count}**"
+        # Note: Success/Failed counts might not sum to total if groups are involved
+    )
     try:
-        # Check for cancellation before processing
-        if user_id in ongoing_tasks and ongoing_tasks[user_id]["cancel"]:
-            LOGGER(__name__).info(f"Task cancelled by user {user_id} before processing message {chat_message.id}")
-            return False
+        await status_message.edit(final_text)
+    except Exception as final_edit_err:
+        LOGGER(__name__).error(f"Error editing final status: {final_edit_err}")
+        await cmd_message.reply(final_text) # Send as new message if edit fails
 
-        if chat_message.document or chat_message.video or chat_message.audio:
-            file_size = (
-                chat_message.document.file_size if chat_message.document else
-                chat_message.video.file_size if chat_message.video else
-                chat_message.audio.file_size
-            )
-            if not await fileSizeLimit(file_size, message, "download", user.me.is_premium):
-                return False
 
-        parsed_caption = await get_parsed_msg(chat_message.caption or "", chat_message.caption_entities)
-        parsed_text = await get_parsed_msg(chat_message.text or "", chat_message.entities)
-        target_chat_id = forward_chat_id if forward_chat_id else message.chat.id
+# Renamed from process_message, handles the actual content forwarding/copying
+async def process_message_content(bot: Client, cmd_message: Message, user: Client, chat_message: Message, target_chat_id: int):
+    """Processes the content of a single fetched message (copy or download/upload fallback).
+       This function should NOT be called directly for media group messages; 
+       process_message_range handles routing to processMediaGroup.
+    """
+    log_prefix = f"[MsgID: {chat_message.id}]"
+    
+    # Double check it's not a media group message if called directly
+    if chat_message.media_group_id:
+        LOGGER(__name__).warning(f"{log_prefix} process_message_content called directly for media group message. This should be handled by processMediaGroup. Skipping.")
+        return False # Avoid duplicate processing
 
-        # --- Media Group Processing --- 
-        if chat_message.media_group_id:
-            if user_id in ongoing_tasks and ongoing_tasks[user_id]["cancel"]:
-                return False
-            LOGGER(__name__).info(f"Processing media group: {chat_message.media_group_id} for user {user_id}")
-            # Ensure processMediaGroup handles FloodWait and cancellation internally
-            if not await processMediaGroup(chat_message, bot, message, target_chat_id, user_id, ongoing_tasks):
-                 # Check if failure was due to flood stop
-                 if user_id in ongoing_tasks and ongoing_tasks[user_id].get("flood_stop", False):
-                     return False # Already handled
-                 await message.reply("**Could not process the media group (possibly cancelled or failed).**")
-                 return False
-            return True
+    try:
+        # --- Optimization 1: Attempt Direct Copy using User Client --- 
+        copied_message = None
+        if target_chat_id and (chat_message.media or chat_message.text):
+            try:
+                LOGGER(__name__).info(f"{log_prefix} Attempting direct copy to {target_chat_id}...")
+                copied_message = await user.copy_message(
+                    chat_id=target_chat_id,
+                    from_chat_id=chat_message.chat.id,
+                    message_id=chat_message.id,
+                )
+                if copied_message:
+                    LOGGER(__name__).info(f"{log_prefix} Direct copy successful.")
+                    await asyncio.sleep(0.5) # Small delay after copy
+                    return True # Successfully copied
+                else:
+                    # copy_message returning None usually indicates failure
+                    LOGGER(__name__).warning(f"{log_prefix} Direct copy attempt returned None/False.")
 
-        # --- Single Media Processing --- 
-        elif chat_message.media:
-            if user_id in ongoing_tasks and ongoing_tasks[user_id]["cancel"]:
-                return False
-                
+            except FloodWait as e:
+                LOGGER(__name__).warning(f"{log_prefix} FloodWait during copy: waiting {e.value}s")
+                await asyncio.sleep(e.value + 1) # Wait a bit longer
+                # Retry copy once after flood wait
+                try:
+                    LOGGER(__name__).info(f"{log_prefix} Retrying direct copy after FloodWait...")
+                    copied_message = await user.copy_message(
+                        chat_id=target_chat_id,
+                        from_chat_id=chat_message.chat.id,
+                        message_id=chat_message.id,
+                    )
+                    if copied_message:
+                        LOGGER(__name__).info(f"{log_prefix} Direct copy successful after retry.")
+                        await asyncio.sleep(0.5)
+                        return True
+                    else:
+                         LOGGER(__name__).warning(f"{log_prefix} Direct copy retry returned None/False.")
+                except FloodWait as e2:
+                     LOGGER(__name__).error(f"{log_prefix} FloodWait again after retry: {e2.value}s. Giving up on copy.")
+                except Exception as retry_err:
+                     LOGGER(__name__).error(f"{log_prefix} Direct copy retry failed: {retry_err}. Falling back.")
+
+            except Exception as copy_err:
+                LOGGER(__name__).warning(f"{log_prefix} Direct copy failed: {type(copy_err).__name__} - {copy_err}. Falling back.")
+
+        # --- Optimization 2: Skip Download/Upload if Copy Succeeded --- 
+        if copied_message:
+             return True # Already handled
+
+        # --- Fallback: Download and Upload using Bot Client --- 
+        # Only use this if copy failed
+        if chat_message.media or chat_message.text:
+            LOGGER(__name__).info(f"{log_prefix} Proceeding with download/upload fallback.")
+
+            # File size check (important for download)
+            file_size = getattr(chat_message.document or chat_message.video or chat_message.audio or chat_message.photo, "file_size", 0)
+            if file_size and not await fileSizeLimit(file_size, cmd_message, "forward (fallback)", user.me.is_premium):
+                return False # Skip this message due to size
+
             start_time = time()
+            media_path = None
             try:
-                progress_message = await message.reply("**📥 Preparing Download...**") 
-            except FloodWait as fw_prog:
-                 await handle_flood_wait(fw_prog, user_id, message)
-                 return False # Stop task
-            except Exception as e_prog:
-                 LOGGER(__name__).error(f"Error sending progress message for user {user_id}: {e_prog}")
-                 await message.reply(f"**Error starting download: {e_prog}**")
-                 if user_id in ongoing_tasks: ongoing_tasks[user_id]["cancel"] = True
-                 return False # Stop task
+                if chat_message.media:
+                    LOGGER(__name__).info(f"{log_prefix} Downloading media for fallback upload... (User: {user.me.id})")
+                    # Download using USER client, as bot might not have access
+                    media_path = await user.download_media(
+                        message=chat_message,
+                        # file_name= # Optional: Define a structured path
+                        # progress= # Disable progress for fallback?
+                    )
+                    if not media_path or not os.path.exists(media_path):
+                         raise Exception(f"Download failed or returned invalid path: {media_path}")
+                    LOGGER(__name__).info(f"{log_prefix} Downloaded to: {media_path}")
 
-            try:
-                 media_path = await chat_message.download(
-                    progress=Leaves.progress_for_pyrogram,
-                    progress_args=progressArgs("📥 Downloading", progress_message, start_time)
-                 )
-            except FloodWait as fw_dl:
-                 await handle_flood_wait(fw_dl, user_id, message, progress_message)
-                 return False # Stop task
-            except Exception as download_err:
-                 LOGGER(__name__).error(f"Error during media download for message {chat_message.id} user {user_id}: {download_err}")
-                 try: await progress_message.edit(f"**❌ Download Failed: {download_err}**")
-                 except Exception: pass
+                    # Upload using BOT client
+                    parsed_caption = await get_parsed_msg(chat_message.caption or "", chat_message.caption_entities)
+                    LOGGER(__name__).info(f"{log_prefix} Uploading media via bot... (Bot: {bot.me.id})")
+
+                    # Use specific send methods, relying on Pyrogram defaults
+                    if chat_message.photo:
+                        await bot.send_photo(
+                            chat_id=target_chat_id, photo=media_path, caption=parsed_caption or ""
+                        )
+                    elif chat_message.video:
+                        await bot.send_video(
+                            chat_id=target_chat_id, video=media_path, caption=parsed_caption or ""
+                        )
+                    elif chat_message.audio:
+                        await bot.send_audio(
+                            chat_id=target_chat_id, audio=media_path, caption=parsed_caption or ""
+                        )
+                    elif chat_message.document:
+                        await bot.send_document(
+                            chat_id=target_chat_id, document=media_path, caption=parsed_caption or ""
+                        )
+                    else:
+                         raise Exception("Unknown media type during fallback upload.")
+
+                    LOGGER(__name__).info(f"{log_prefix} Fallback upload successful.")
+                    await asyncio.sleep(0.5) # Small delay after upload
+
+                elif chat_message.text:
+                    LOGGER(__name__).info(f"{log_prefix} Sending text message (fallback).")
+                    parsed_text = await get_parsed_msg(chat_message.text or "", chat_message.entities)
+                    await bot.send_message(chat_id=target_chat_id, text=parsed_text)
+                    await asyncio.sleep(0.2)
+
+                return True
+
+            except FloodWait as e:
+                 LOGGER(__name__).warning(f"{log_prefix} FloodWait during fallback download/upload: waiting {e.value}s")
+                 await asyncio.sleep(e.value + 1)
+                 return False # Count as failed
+            except Exception as down_up_err:
+                 LOGGER(__name__).error(f"{log_prefix} Download/Upload fallback failed: {down_up_err}", exc_info=True)
                  return False
-
-            # Check cancellation after download
-            if user_id in ongoing_tasks and ongoing_tasks[user_id]["cancel"]:
-                LOGGER(__name__).info(f"Task cancelled by user {user_id} after downloading message {chat_message.id}")
-                try: await progress_message.edit("**Task Cancelled after download.**")
-                except Exception: pass
-                # Cleanup handled in finally block
-                return False
-
-            LOGGER(__name__).info(f"Downloaded media: {media_path}")
-            try: await progress_message.edit("**📤 Preparing Upload...**")
-            except Exception: pass
-
-            media_type = (
-                "photo" if chat_message.photo else
-                "video" if chat_message.video else
-                "audio" if chat_message.audio else
-                "document"
-            )
-
-            # Send media
-            thumb = None
-            try:
-                if media_type == "photo":
-                    await bot.send_photo(chat_id=target_chat_id, photo=media_path, caption=parsed_caption or "",
-                                         progress=Leaves.progress_for_pyrogram, progress_args=progressArgs("📤 Uploading", progress_message, start_time))
-                elif media_type == "video":
-                    thumb_path = "Assets/video_thumb.jpg" # Define here for finally block
-                    if os.path.exists(thumb_path):
-                        try: os.remove(thumb_path)
-                        except OSError: pass
-                    duration = (await get_media_info(media_path))[0]
-                    thumb = await get_video_thumbnail(media_path, duration)
-                    width, height = chat_message.video.width, chat_message.video.height
-                    if (not width or not height) and thumb and thumb != "none":
-                        try:
-                            with Image.open(thumb) as img: width, height = img.size
-                        except Exception as img_err: LOGGER(__name__).warning(f"Could not read thumb dimensions: {img_err}")
-                    if not width: width = 640
-                    if not height: height = 360
-                    if thumb == "none": thumb = None
-
-                    await bot.send_video(chat_id=target_chat_id, video=media_path, duration=duration, width=width, height=height, thumb=thumb, caption=parsed_caption or "",
-                                         progress=Leaves.progress_for_pyrogram, progress_args=progressArgs("📤 Uploading", progress_message, start_time))
-                elif media_type == "audio":
-                    duration, artist, title = await get_media_info(media_path)
-                    await bot.send_audio(chat_id=target_chat_id, audio=media_path, duration=duration, performer=artist, title=title, caption=parsed_caption or "",
-                                         progress=Leaves.progress_for_pyrogram, progress_args=progressArgs("📤 Uploading", progress_message, start_time))
-                elif media_type == "document":
-                    await bot.send_document(chat_id=target_chat_id, document=media_path, caption=parsed_caption or "",
-                                            progress=Leaves.progress_for_pyrogram, progress_args=progressArgs("📤 Uploading", progress_message, start_time))
-            except FloodWait as fw_send:
-                 await handle_flood_wait(fw_send, user_id, message, progress_message)
-                 # Cleanup handled in finally block
-                 return False # Stop task
-            except Exception as send_err:
-                 LOGGER(__name__).error(f"Error sending media for message {chat_message.id} user {user_id}: {send_err}")
-                 try: await progress_message.edit(f"**❌ Upload Failed: {send_err}**")
-                 except Exception: pass
-                 # Cleanup handled in finally block
-                 return False # Indicate failure
-
-            try: await progress_message.delete()
-            except Exception: pass
-            progress_message = None # Prevent deletion in finally
-            return True # Success for single media
-
-        # --- Text Message Processing --- 
-        elif chat_message.text or chat_message.caption:
-            if user_id in ongoing_tasks and ongoing_tasks[user_id]["cancel"]:
-                return False
-            try:
-                await bot.send_message(chat_id=target_chat_id, text=parsed_text or parsed_caption)
-                return True # Success for text message
-            except FloodWait as fw_text:
-                 await handle_flood_wait(fw_text, user_id, message)
-                 return False # Stop task
-            except Exception as text_err:
-                LOGGER(__name__).error(f"Error sending text message {chat_message.id} user {user_id}: {text_err}")
-                await message.reply(f"**Error sending text message {chat_message.id}: {text_err}**")
-                return False # Indicate failure
+            finally:
+                if media_path and os.path.exists(media_path):
+                    try:
+                        os.remove(media_path)
+                        LOGGER(__name__).info(f"{log_prefix} Cleaned up fallback file: {media_path}")
+                    except OSError as rm_err:
+                         LOGGER(__name__).error(f"{log_prefix} Error removing fallback file {media_path}: {rm_err}")
         else:
-            LOGGER(__name__).info(f"Message {chat_message.id} has no downloadable/forwardable content for user {user_id}.")
-            return False # Indicate skipped/nothing to process
+            # This case means: copy failed AND it wasn't media/text (e.g., service message?)
+            LOGGER(__name__).warning(f"{log_prefix} Message has no processable content or copy failed.")
+            return False # Treat as failure/skip
 
-    except FloodWait as fw_outer:
-        # Catch flood waits happening outside specific blocks within process_message
-        await handle_flood_wait(fw_outer, user_id, message, progress_message)
-        return False # Stop task
     except Exception as e:
-        LOGGER(__name__).error(f"Error processing message {chat_message.id} for user {user_id}: {str(e)}", exc_info=True)
-        # Avoid double error reporting if progress_message exists
-        if not progress_message:
-             await message.reply(f"**Error processing message {chat_message.id}: {str(e)}**")
-        else:
-             try: await progress_message.edit(f"**Error processing message: {str(e)}**")
-             except Exception: pass
-        return False # Indicate general failure
-    finally:
-        # Ensure cleanup of downloaded file and thumbnail
-        if media_path and os.path.exists(media_path):
-            try: os.remove(media_path)
-            except OSError as e: LOGGER(__name__).warning(f"Error removing media file {media_path}: {e}")
-        if thumb_path and os.path.exists(thumb_path):
-            try: os.remove(thumb_path)
-            except OSError as e: LOGGER(__name__).warning(f"Error removing thumb file {thumb_path}: {e}")
-        # Try deleting progress message if it still exists and wasn't deleted after success
-        if progress_message:
-             try: await progress_message.delete()
-             except Exception: pass
+        LOGGER(__name__).error(f"{log_prefix} Unexpected error in process_message_content: {str(e)}", exc_info=True)
+        return False
+
+    # Should not be reached
+    return False
 
 
+# --- Stats and Logs Commands (Keep existing logic but update text/paths if needed) ---
 @bot.on_message(filters.command("stats") & filters.private)
 async def stats(_, message: Message):
-    # ... (stats command remains the same) ...
     currentTime = get_readable_time(time() - PyroConf.BOT_START_TIME)
-    try:
-        total, used, free = shutil.disk_usage(".")
-        total = get_readable_file_size(total)
-        used = get_readable_file_size(used)
-        free = get_readable_file_size(free)
-    except FileNotFoundError:
-        total, used, free = "N/A", "N/A", "N/A"
-        
-    try:
-        net_io = psutil.net_io_counters()
-        sent = get_readable_file_size(net_io.bytes_sent)
-        recv = get_readable_file_size(net_io.bytes_recv)
-    except Exception:
-        sent, recv = "N/A", "N/A"
-        
-    try:    
-        cpuUsage = psutil.cpu_percent(interval=0.5)
-        memory = psutil.virtual_memory().percent
-        disk = psutil.disk_usage("/").percent
-        process = psutil.Process(os.getpid())
-        mem_used = f"{round(process.memory_info()[0] / 1024**2)} MiB"
-    except Exception:
-         cpuUsage, memory, disk, mem_used = "N/A", "N/A", "N/A", "N/A"
+    total, used, free = shutil.disk_usage(".")
+    total = get_readable_file_size(total)
+    used = get_readable_file_size(used)
+    free = get_readable_file_size(free)
+    sent = get_readable_file_size(psutil.net_io_counters().bytes_sent)
+    recv = get_readable_file_size(psutil.net_io_counters().bytes_recv)
+    cpuUsage = psutil.cpu_percent(interval=0.5)
+    memory = psutil.virtual_memory().percent
+    disk = psutil.disk_usage("/").percent
+    process = psutil.Process(os.getpid())
 
-    stats = (
-        "**📊 Bot Status**\n\n"
+    stats_text = (
+        "**📊 Bot Statistics**\n\n"
         f"**➜ Bot Uptime:** `{currentTime}`\n"
-        f"**➜ CPU:** `{cpuUsage}%` | "
-        f"**➜ RAM:** `{memory}%` | "
-        f"**➜ DISK:** `{disk}%`\n"
-        f"**➜ Memory Usage:** `{mem_used}`\n\n"
-        f"**➜ Total Disk Space:** `{total}`\n"
-        f"**➜ Used:** `{used}`\n"
-        f"**➜ Free:** `{free}`\n\n"
-        f"**➜ Upload:** `{sent}`\n"
-        f"**➜ Download:** `{recv}`"
+        f"**➜ CPU:** `{cpuUsage}%` | **RAM:** `{memory}%` | **DISK:** `{disk}%`\n"
+        f"**➜ Memory Usage:** `{round(process.memory_info()[0] / 1024**2)} MiB`\n\n"
+        f"**➜ Total Disk:** `{total}` | **Used:** `{used}` | **Free:** `{free}`\n"
+        f"**➜ Network Up:** `{sent}` | **Down:** `{recv}`"
     )
-    await message.reply(stats)
+    await message.reply(stats_text)
 
 
 @bot.on_message(filters.command("logs") & filters.private)
 async def logs(_, message: Message):
-    # ... (logs command remains the same) ...
-    log_file = "logs.txt"
+    log_file = "logs.txt" # Make sure logger is configured to write here
     if os.path.exists(log_file):
         try:
             await message.reply_document(document=log_file, caption="**Bot Logs**")
-        except Exception as e:
-             LOGGER(__name__).error(f"Failed to send logs: {e}")
-             await message.reply(f"**Error sending logs: {e}**")
+        except Exception as log_err:
+             await message.reply(f"**Error sending logs:** {log_err}")
+             LOGGER(__name__).error(f"Error sending log file: {log_err}")
     else:
         await message.reply("**Log file not found.**")
 
-# Need to modify processMediaGroup in helpers/utils.py to accept user_id and ongoing_tasks
-# and implement FloodWait handling with handle_flood_wait call.
 
+# --- Main Execution --- 
 if __name__ == "__main__":
-    # ... (main execution block remains largely the same) ...
+    # Make 'Assets' directory if it doesn't exist (used by original code, keep for now)
     if not os.path.isdir("Assets"):
         os.makedirs("Assets")
         
+    # Ensure download directory exists (Pyrogram default is 'downloads/')
+    if not os.path.isdir("downloads"):
+        os.makedirs("downloads")
+
     try:
-        import os
+        # Flask health check remains the same
         from flask import Flask, jsonify
         import threading
-        
+
         app = Flask(__name__)
-        
-        @app.route("/")
+        @app.route('/')
         def index():
-            return jsonify({"status": "running"})
-        
+            return jsonify({"status": "running", "bot": "media_forwarder_optimized"})
+
         port = int(os.environ.get("PORT", 8000))
-        
+
         def run_flask():
-            LOGGER(__name__).info(f"Starting web server on port {port}")
+            LOGGER(__name__).info(f"Starting health check server on port {port}")
             try:
-                app.run(host="0.0.0.0", port=port)
+                 # Use waitress or similar for production
+                 from waitress import serve
+                 serve(app, host="0.0.0.0", port=port)
+                 # app.run(host="0.0.0.0", port=port) # Development server
             except Exception as flask_err:
-                 LOGGER(__name__).error(f"Flask server failed: {flask_err}", exc_info=True)
-        
+                 LOGGER(__name__).error(f"Flask server error: {flask_err}")
+
         flask_thread = threading.Thread(target=run_flask, daemon=True)
         flask_thread.start()
-        
-        LOGGER(__name__).info("Bot Starting!")
+
+        # Start Clients (User client first is often recommended)
+        LOGGER(__name__).info("Starting User Client...")
         user.start()
-        PyroConf.BOT_START_TIME = time() # Record start time
-        bot.run()
-        
+        user_me = user.get_me()
+        LOGGER(__name__).info(f"User Client started as: {user_me.first_name} (ID: {user_me.id}, Premium: {user_me.is_premium})")
+
+        LOGGER(__name__).info("Starting Bot Client...")
+        bot.start()
+        bot_me = bot.get_me()
+        LOGGER(__name__).info(f"Bot Client started as: @{bot_me.username} (ID: {bot_me.id})")
+
+        # Store start time in config or global variable if needed for stats uptime
+        if not hasattr(PyroConf, 'BOT_START_TIME'):
+             PyroConf.BOT_START_TIME = time()
+
+        LOGGER(__name__).info("Bot is now running! Use /dl command.")
+        # Keep main thread alive using Pyrogram's idle
+        from pyrogram import idle
+        idle()
+
     except KeyboardInterrupt:
-        LOGGER(__name__).info("Bot stopping due to KeyboardInterrupt...")
+        LOGGER(__name__).info("Shutdown signal received.")
     except Exception as err:
-        LOGGER(__name__).critical(f"Bot failed to start or run: {err}", exc_info=True)
+        LOGGER(__name__).error(f"Error during startup or main loop: {err}", exc_info=True)
     finally:
-        LOGGER(__name__).info("Bot Stopped")
-        ongoing_tasks.clear()
+        LOGGER(__name__).info("Stopping clients...")
+        if user.is_connected:
+            user.stop()
+        if bot.is_connected:
+            bot.stop()
+        LOGGER(__name__).info("Clients stopped. Exiting.")
+
 
